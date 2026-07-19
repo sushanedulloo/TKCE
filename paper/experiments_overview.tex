@@ -1,0 +1,478 @@
+% =====================================================================
+%  TKCE — Comprehensive Experiments Overview (with plain-language explanations)
+%  A complete, self-explaining reference for every experiment in the project.
+%  Compiles standalone:  pdflatex experiments_overview.tex
+% =====================================================================
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\K}{K}
+\newcommand{\yes}{\checkmark}
+\title{\textbf{Tree-Kernel Contrastive Embeddings (TKCE)}\\[2pt]
+\large Comprehensive Experiments Overview\\[2pt]
+\normalsize\itshape with plain-language explanations of every component}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+\begin{center}\small Every model, loss, kernel, and experiment is explained in
+simple language (the ``\emph{In plain words}'' notes) alongside the technical
+detail, so the design is understandable without reading the code.\end{center}
+\tableofcontents
+\bigskip
+
+% =====================================================================
+\section{The Big Idea (start here)}
+% =====================================================================
+\paragraph{The problem.} On spreadsheet-style (\emph{tabular}) data, tree
+ensembles such as XGBoost and CatBoost usually beat neural networks. We want to
+know whether we can give a neural network the ``way of thinking'' that makes
+trees good, and thereby close that gap.
+
+\paragraph{The idea in one line.} A trained tree ensemble already knows which
+rows are ``alike'' (rows that keep landing in the same leaf/bucket). We turn that
+notion of similarity into a new set of coordinates (an \emph{embedding}) for each
+row using \emph{contrastive learning}, and then let an ordinary neural network do
+the prediction on top of those coordinates. We call the method \textbf{TKCE}
+(Tree-Kernel Contrastive Embeddings).
+
+\paragraph{An analogy.} The trees act like a teacher who says ``these two days
+are similar, those two are different.'' The contrastive encoder is a student who
+rearranges all the rows on a map so that similar rows sit close together. A small
+neural network then makes predictions using positions on that map instead of the
+raw numbers.
+
+\paragraph{Why it might work.} Grinsztajn et al.\ (2022) showed trees beat neural
+nets on tables for three reasons: (1) trees ignore useless/noisy columns, (2)
+trees respect the natural axis-aligned structure of tables (they are not fooled
+by rotating the data), and (3) trees can fit ``jumpy''/irregular patterns. Our
+tree-derived similarity encodes exactly these properties, so the embedding should
+carry them into the neural network.
+
+\paragraph{Research questions.}
+\begin{description}[leftmargin=3.2em,style=nextline]
+  \item[RQ1] Does TKCE close the gap between trees and a neural network trained on
+  raw columns?
+  \item[RQ2] Is it better to learn the embedding \emph{first} then train (two-stage),
+  or both \emph{together} (joint)?
+  \item[RQ3] Does it matter whether the tree buckets were built \emph{using the
+  labels} (GBT) or \emph{without} them (Mondrian)?
+  \item[RQ4] Does the learned embedding beat the cheap trick of feeding raw tree
+  buckets to a network, and does it rival strong modern deep-tabular models?
+  \item[RQ5] Is the \emph{contrastive learning} actually necessary, or does plain
+  \emph{PCA} (linear compression) of the same tree information work just as well?
+\end{description}
+
+% =====================================================================
+\section{Method}
+% =====================================================================
+\subsection{The tree kernel (the similarity signal)}
+A decision tree sends each row into one leaf (a bucket). Two rows are counted as
+``similar'' in that tree if they land in the same leaf. Averaging over all $T$
+trees gives a similarity score in $[0,1]$:
+\begin{equation}
+\K(x_i,x_j)=\frac{1}{T}\sum_{t=1}^{T}\ind[\text{same leaf in tree }t].
+\end{equation}
+\textit{In plain words:} the similarity of two rows is simply \emph{the fraction
+of trees that put them in the same bucket}. If they always share a bucket the
+score is 1; if never, 0. (Mathematically this approximates a classical smooth
+similarity, the Laplace kernel.)
+
+\paragraph{Where the buckets come from (kernel sources).}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{GBT (supervised).} Buckets from gradient-boosted trees trained
+  \emph{using the labels}. \textit{In plain words:} similarity that already knows
+  what we are trying to predict. This is our main choice.
+  \item \textbf{Mondrian (unsupervised).} Buckets from \emph{random} cuts of the
+  feature space, \emph{without} using labels. \textit{In plain words:} a generic,
+  label-free notion of ``nearby.'' Tests whether even a blind tree prior helps.
+  \item \textbf{Random Forest.} Buckets from a random forest (available in code,
+  not in the main model list).
+\end{itemize}
+
+\subsection{The contrastive encoder (turning similarity into a map)}
+A small neural network $\phi$ (the \emph{encoder}) maps each row to a short
+vector, and is trained so that rows the trees call ``similar'' get vectors that
+point in nearly the same direction. \textit{In plain words:} it learns a map on
+which similar rows are close and dissimilar rows are far. This training uses no
+manual labels of similarity --- the trees provide them for free.
+
+\subsection{The two ways to use it: two-stage vs.\ joint}
+\begin{description}[leftmargin=2em,style=nextline]
+  \item[\textbf{TKCE two-stage}] Do it in two separate steps. \emph{Step 1:} train
+  the encoder $\phi$ with the contrastive objective until it produces a good map.
+  \emph{Step 2:} freeze that map and train a normal neural network (MLP or
+  TabResNet) to predict the target from the map coordinates. \textit{In plain
+  words:} first learn the representation, then learn the task on top of it.
+  \item[\textbf{TKCE joint}] Do both at once in a single network: the encoder and
+  the predictor are trained together, and the loss is
+  \[
+  \underbrace{\mathcal{L}_{\text{task}}}_{\text{predict the target}}
+  \;+\;\lambda\cdot
+  \underbrace{\mathcal{L}_{\text{contrastive}}}_{\text{keep similar rows close}}.
+  \]
+  \textit{In plain words:} the network learns to predict \emph{and} to respect the
+  tree similarity at the same time, with a knob $\lambda$ controlling how much it
+  cares about the similarity. $\lambda=0$ is a plain network; large $\lambda$
+  forces it to mostly copy the tree map. This is like training the embedding layer
+  of a network jointly with the task, the way modern deep models do.
+\end{description}
+
+\subsection{The fixed-head rule (a fair comparison)}
+The final predictor (the ``head'') is kept \emph{identical} for the raw-feature
+network, the tree-bucket network, the PCA network, and every TKCE variant.
+\textit{In plain words:} we never let one method win just because it had a bigger
+or better-tuned final network --- the only thing we change is \emph{what goes into}
+that fixed predictor. So any difference in results comes from the input
+representation, which is exactly what we are studying. (Only the strong deep
+baselines, FT-Transformer and the numerical-embedding MLP, keep their own tuned
+designs, because they are complete architectures, not a head on a representation.)
+
+% =====================================================================
+\section{The 16 Models --- each explained}
+% =====================================================================
+Registry names match \code{tkce.tuning.MODEL\_SPECS}. Below, each is described in
+one or two plain sentences.
+
+\subsection{Tree baselines (the bar to beat)}
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=2pt]
+  \item[\code{xgboost}, \code{lightgbm}, \code{catboost}] Gradient-boosted trees:
+  build many small trees one after another, each correcting the previous ones'
+  mistakes. These are the strongest classical tabular models.
+  \item[\code{random\_forest}] Many independent trees on random data subsets;
+  average their votes. A robust, simpler tree baseline.
+\end{description}
+
+\subsection{Neural networks on raw columns (the basic NN baseline)}
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=2pt]
+  \item[\code{mlp\_raw}] A plain multi-layer neural network trained directly on the
+  raw table columns. This is the ``can a normal NN do it?'' baseline. (Uses the
+  \emph{fixed head}.)
+  \item[\code{tabresnet\_raw}] A neural network with residual (skip) connections
+  designed for tables (Gorishniy 2021), on raw columns. A slightly stronger NN
+  baseline. (Fixed head.)
+\end{description}
+\noindent\emph{Note:} the neural-network baselines are not limited to MLP and
+TabResNet --- we also include the two \emph{stronger} deep-tabular models below.
+The neural side is therefore represented by both a \emph{ResNet-style} network
+(TabResNet) \textbf{and} a \emph{Transformer-style} network (FT-Transformer).
+
+\subsection{Strong modern deep-tabular baselines (the high bar)}
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=2pt]
+  \item[\code{ft\_transformer}] \textbf{FT-Transformer} (the Transformer-style
+  neural baseline, and the counterpart to the ResNet-style \code{tabresnet\_raw}).
+  A Transformer --- the architecture behind large language models --- adapted to
+  tables: each feature becomes a ``token'' and attention lets features interact.
+  A strong, modern deep baseline included alongside TabResNet.
+  \item[\code{num\_embed\_mlp}] An MLP where each number is first turned into a
+  small vector using sine/cosine (``periodic'') features before entering the
+  network --- a known trick that makes MLPs competitive with trees (Gorishniy
+  2022). It is a \emph{rival embedding method} to ours.
+\end{description}
+
+\subsection{Tree-feature baselines (cheap alternatives to our method)}
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=2pt]
+  \item[\code{leafonehot\_mlp}] Record which leaf each row falls into across all
+  trees, turn that into a long list of 0/1 flags, and feed it to the fixed neural
+  head. The classic ``GBDT $+$ neural net'' trick (He et al.\ 2014). This is the
+  cheap alternative our contrastive embedding must beat (RQ4).
+  \item[\code{pca\_gbt\_mlp}, \code{pca\_gbt\_tabresnet}] Take the same leaf
+  information, but compress it with \textbf{PCA} (a standard \emph{linear}
+  compression) instead of contrastive learning, then feed it to the fixed head.
+  Because the leaf flags are exactly the tree kernel's ``fingerprint,'' PCA here is
+  the \emph{linear} version of our embedding. Comparing it to TKCE tells us whether
+  the (non-linear) contrastive learning is really pulling its weight (RQ5).
+\end{description}
+
+\subsection{TKCE --- two-stage (our method, step-by-step)}
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=2pt]
+  \item[\code{tkce2s\_gbt\_mlp}] \emph{Our method.} Learn the embedding from the
+  supervised (GBT) tree kernel by contrastive learning, freeze it, then train an
+  MLP on the embedding.
+  \item[\code{tkce2s\_gbt\_tabresnet}] Same, but a TabResNet predicts on the
+  embedding.
+  \item[\code{tkce2s\_mondrian\_mlp}] Same two-stage recipe, but the tree kernel is
+  the \emph{unsupervised} Mondrian one (built without labels). Tests the label-free
+  version.
+\end{description}
+
+\subsection{TKCE --- joint (our method, end-to-end)}
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=2pt]
+  \item[\code{tkce\_joint\_gbt\_mlp}] \emph{Our method.} One network learns the
+  embedding \emph{and} predicts at the same time, with the contrastive objective
+  added as a helper (weight $\lambda$). MLP predictor.
+  \item[\code{tkce\_joint\_gbt\_tabresnet}] The same joint idea with a TabResNet
+  predictor.
+\end{description}
+
+% =====================================================================
+\section{The 7 Contrastive Losses --- each explained}
+% =====================================================================
+The ``loss'' is the rule that tells the encoder what a good map looks like. We try
+seven (\code{tkce.losses.ALL\_LOSSES}). All work in two-stage; the five in-batch
+ones also work in joint (Table~\ref{tab:losses}).
+
+\begin{description}[leftmargin=2.6em,style=nextline,itemsep=2pt]
+  \item[\code{infonce}] For each row, pull it toward its similar partner and push
+  it away from all other rows in the batch. The standard modern contrastive loss
+  (used by SimCLR/CLIP).
+  \item[\code{kernel\_regression}] Directly force the similarity of two embeddings
+  to equal the tree-kernel number. The most literal way to copy the kernel.
+  \item[\code{contrastive}] The classic version: make similar pairs close, and push
+  dissimilar pairs apart until they are at least a fixed ``margin'' away (Hadsell
+  et al.\ 2006).
+  \item[\code{triplet}] Look at three rows --- an anchor, a similar one, and a
+  dissimilar one --- and make the anchor closer to the similar one than to the
+  dissimilar one by a margin (the face-recognition loss, FaceNet).
+  \item[\code{supcon}] Like InfoNCE, but each row can have \emph{many} similar
+  partners pulled together at once (the tree kernel naturally provides many).
+  Supervised Contrastive loss (Khosla et al.\ 2020).
+  \item[\code{aninfonce}] InfoNCE that lets some map directions matter more than
+  others (it learns a weight per dimension), so a few strong factors do not drown
+  out the rest (arXiv:2407.00143).
+  \item[\code{clip\_infonce}] The CLIP recipe: compare anchors and their partners in
+  \emph{both} directions and also \emph{learn} the ``temperature'' (how sharply to
+  focus). Learnable-temperature symmetric InfoNCE (arXiv:2103.00020).
+\end{description}
+
+\begin{longtable}{@{}p{3.0cm} p{6.2cm} c c@{}}
+\toprule
+\textbf{Loss} & \textbf{One-line idea} & \textbf{Two-stage} & \textbf{Joint} \\
+\midrule
+\endhead
+\code{infonce} & 1 positive vs.\ in-batch negatives & \yes & \yes \\
+\code{kernel\_regression} & match embedding similarity to $\K$ & \yes & --- \\
+\code{contrastive} & margin pull/push on pairs & \yes & \yes \\
+\code{triplet} & anchor closer to pos than neg & \yes & \yes \\
+\code{supcon} & many positives per anchor & \yes & --- \\
+\code{aninfonce} & per-dimension importance weights & \yes & \yes \\
+\code{clip\_infonce} & symmetric, learnable temperature & \yes & \yes \\
+\bottomrule
+\caption{The seven losses and where each is available.}
+\label{tab:losses}
+\end{longtable}
+
+% =====================================================================
+\section{Datasets}
+% =====================================================================
+We use the Grinsztajn et al.\ (2022) benchmark via four OpenML ``suites'': 337
+(numerical classification), 336 (numerical regression), 334 (heterogeneous
+classification, i.e.\ numbers $+$ categories), 335 (heterogeneous regression).
+Running the entire benchmark at full tuning is very expensive, so for the paper we
+use a fixed \textbf{15-dataset subset} chosen by a size rule
+(Sec.~\ref{sec:subset}).
+
+\subsection{The 15-dataset evaluation subset}\label{sec:subset}
+\paragraph{Selection rule (for the paper).} \emph{For tractability under the equal
+100-trial tuning budget, within each of the four suites we take the smallest
+datasets by sample count (excluding two with $>$300 features for one-hot/PCA
+tractability), giving four numerical-classification, four numerical-regression,
+three heterogeneous-classification, and four heterogeneous-regression datasets.
+The subset is chosen purely by dataset size, independently of any model's
+performance, to avoid selection bias.}
+
+\begin{longtable}{@{}p{4.6cm} l r r@{}}
+\toprule
+\textbf{Quadrant} & \textbf{Dataset} & \textbf{Task ID} & \textbf{Rows} \\
+\midrule
+\endhead
+\multirow{4}{*}{Numerical classification}
+ & eye\_movements & 361070 & 7{,}608 \\
+ & heloc & 361278 & 10{,}000 \\
+ & pol & 361062 & 10{,}082 \\
+ & bank-marketing & 361066 & 10{,}578 \\
+\midrule
+\multirow{4}{*}{Numerical regression}
+ & abalone & 361280 & 4{,}177 \\
+ & wine\_quality & 361076 & 6{,}497 \\
+ & cpu\_act & 361072 & 8{,}192 \\
+ & yprop\_4\_1 & 361279 & 8{,}885 \\
+\midrule
+\multirow{3}{*}{Heterogeneous classification}
+ & compas-two-years & 361286 & 4{,}966 \\
+ & default-of-credit-card-clients & 361283 & 13{,}272 \\
+ & electricity & 361110 & 38{,}474 \\
+\midrule
+\multirow{4}{*}{Heterogeneous regression}
+ & analcatdata\_supreme & 361093 & 4{,}052 \\
+ & visualizing\_soil & 361094 & 8{,}641 \\
+ & Brazilian\_houses & 361098 & 10{,}692 \\
+ & topo\_2\_1 & 361287 & 8{,}885 \\
+\bottomrule
+\caption{The 15-dataset subset used for the paper.}
+\label{tab:datasets}
+\end{longtable}
+
+\noindent\textbf{\code{-{}-tasks} string:}\\
+\code{361070,361278,361062,361066,361280,361076,361072,361279,361286,361283,361110,361093,361094,361098,361287}
+
+% =====================================================================
+\section{Experimental Protocol}
+% =====================================================================
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Preprocessing.} Numbers are standardised (using training data
+  only). Categories are turned into integer codes (for trees) and into 0/1 flags
+  (for the plain MLP). Regression targets are standardised, but results are
+  reported on the original scale.
+  \item \textbf{Splits.} Each dataset is divided into train / validation / test
+  (validation is used to pick settings, test is only for the final number).
+  \item \textbf{Fair tuning.} Every model that has settings to tune gets the
+  \emph{same budget} of 100 automatic trials (Optuna), matching the fair-comparison
+  standard of Grinsztajn et al. The fixed-head baselines have nothing to tune and
+  are trained once.
+  \item \textbf{Repeats (seeds).} We tune once, then re-run the winning settings on
+  several random splits (default 3) and report the average $\pm$ spread.
+  \item \textbf{Scores.} Classification: accuracy and AUC (main score = AUC).
+  Regression: RMSE and $R^2$ (main score = $R^2$). Higher is better for both.
+  \item \textbf{Combining across datasets.} We rank the models on each dataset,
+  average the ranks, draw a ``critical-difference'' diagram (which differences are
+  statistically real), and run Wilcoxon significance tests.
+\end{itemize}
+
+% =====================================================================
+\section{Hyperparameter Search Spaces}
+% =====================================================================
+\emph{In plain words:} this is the list of knobs each model is allowed to adjust
+during tuning. For our method and the tree-feature baselines the final predictor
+is fixed, so only the \emph{encoder} / kernel knobs move.
+
+\noindent Fixed head (all head-bearing models): MLP hidden \code{(256,128)},
+dropout \code{0.1}; TabResNet \code{d=192, d\_hidden=256, n\_blocks=3}; head
+\code{lr=1e-3}. Shared training: \code{head\_epochs=120}, early-stop
+\code{patience=16}, \code{batch\_size=256}, \code{weight\_decay=1e-4}.
+
+\begin{longtable}{@{}p{3.4cm} p{9.4cm}@{}}
+\toprule
+\textbf{Model(s)} & \textbf{Tuned knobs (ranges)} \\
+\midrule
+\endhead
+\code{xgboost} & n\_estimators [100–1000], max\_depth [2–10], lr [0.01–0.3, log], subsample [0.5–1], colsample\_bytree [0.5–1] \\
+\code{lightgbm} & n\_estimators [100–1000], max\_depth [$-1$–12], lr [0.01–0.3, log] \\
+\code{catboost} & n\_estimators [200–1000], max\_depth [3–10], lr [0.01–0.3, log] \\
+\code{random\_forest} & n\_estimators [100–800], max\_depth [4–30] \\
+\code{mlp\_raw}, \code{tabresnet\_raw} & \emph{none} (fixed head; trained once) \\
+\code{ft\_transformer} & d\_token \{64,128,192\}, n\_blocks [1–4], n\_heads $=8$, dropout [0–0.3], lr [1e-4–3e-3, log], weight\_decay [1e-6–1e-3, log] \\
+\code{num\_embed\_mlp} & width \{128,256,384,512\}, depth [1–3], n\_blocks [1–4], dropout [0–0.4], lr [3e-4–5e-3, log], k\_freq \{8,16,32\}, d\_cat \{4,8,16\} \\
+\code{leafonehot\_mlp} & k\_n\_estimators [100–400], k\_max\_depth [3–7] \emph{(fixed head)} \\
+\code{pca\_gbt\_*} & n\_components \{32,64,128\}, k\_n\_estimators [100–400], k\_max\_depth [3–7] \emph{(fixed head)} \\
+\code{tkce2s\_*} & \textbf{encoder:} enc\_width \{128,256,384,512\}, enc\_depth [1–3], enc\_dropout [0–0.4], embedding\_dim \{32,64,128\}, enc\_lr [3e-4–3e-3, log]; \textbf{contrastive/kernel:} temperature [0.05–0.5, log], pos\_threshold [0.4–0.7], pretrain\_epochs [15–40], k\_n\_estimators [100–400], k\_max\_depth [3–7] \emph{(fixed head)} \\
+\code{tkce\_joint\_*} & everything in \code{tkce2s\_*} plus lambda\_contrast [0.05–3.0, log] \\
+\bottomrule
+\caption{What each model is allowed to tune.}
+\label{tab:spaces}
+\end{longtable}
+
+% =====================================================================
+\section{Experiments and Ablations --- what each one asks}
+% =====================================================================
+\begin{description}[leftmargin=2em,style=nextline,itemsep=4pt]
+  \item[Main comparison (RQ1, RQ4)] Run all 16 models on all 15 datasets.
+  \emph{Question:} does our neural network reach the trees, and does it beat the
+  cheap and strong baselines? \emph{Output:} the main results table, the
+  ``gap-closed'' table (how much of the tree$\to$NN gap TKCE recovers), the
+  average-rank table, the critical-difference figure, and Wilcoxon tests.
+  \item[Two-stage vs.\ joint (RQ2)] Compare \code{tkce2s\_gbt\_*} against
+  \code{tkce\_joint\_gbt\_*}. \emph{Question:} is it better to learn the map first
+  then train, or to do both together?
+  \item[Kernel-source ablation (RQ3)] Compare \code{tkce2s\_gbt\_mlp} (labels used
+  to build buckets) against \code{tkce2s\_mondrian\_mlp} (no labels). \emph{Question:}
+  how much does using the labels to build the similarity help?
+  \item[Loss-function ablation] Train the two-stage embedding with each of the 7
+  losses (kernel and head held fixed). \emph{Question:} which contrastive rule
+  produces the best map? \emph{Output:} \code{loss\_ablation.png}.
+  \item[Contrastive vs.\ linear PCA (RQ5)] Compare TKCE to \code{pca\_gbt\_*} (plain
+  linear compression of the same tree information), through the same fixed head.
+  \emph{Question:} is the contrastive learning necessary, or would simple PCA do?
+  \item[Mechanism probes --- \emph{why} it works] Three controlled stress-tests
+  (\code{mechanism.png}): (1) add useless noise columns and see who degrades least;
+  (2) rotate the data and see who degrades (trees/TKCE should, a plain MLP should
+  not); (3) use increasingly ``wiggly'' targets and see who copes. \emph{Question:}
+  does TKCE inherit the three tree strengths?
+  \item[Data-efficiency --- \emph{when} it works] Train on 5\%, 10\%, \dots, 100\%
+  of the data (\code{data\_efficiency.png}). \emph{Question:} does TKCE help most
+  when data is scarce (where trees usually win)?
+  \item[$\lambda$-sweep (joint only)] Vary the contrastive weight $\lambda$
+  (\code{lambda\_sweep.png}). \emph{Question:} how much should the joint model
+  ``listen to'' the tree similarity? A peak above $\lambda=0$ shows it helps.
+\end{description}
+
+% =====================================================================
+\section{How to Run}
+% =====================================================================
+Install \code{requirements-tkce.txt}. Device \code{auto} picks GPU if present.
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Quick check (one dataset):}
+  \code{python run\_slice.py -{}-task 361065 -{}-max-rows 4000 -{}-device auto}
+  \item \textbf{Full run:}
+  \code{python run\_suite.py -{}-tasks <15 ids> -{}-seeds 0,1,2 -{}-trials 100
+  -{}-max-rows 16000 -{}-device auto -{}-out results/suite\_v1} (resumable).
+  \item \textbf{Report:} \code{python make\_report.py -{}-results
+  results/suite\_v1/results\_long.csv -{}-out results/suite\_v1/report}
+  \item \textbf{Analyses:} \code{run\_mechanism.py}, \code{run\_data\_efficiency.py},
+  \code{run\_lambda\_sweep.py}, \code{run\_loss\_ablation.py}.
+\end{itemize}
+
+% =====================================================================
+\section{Outputs}
+% =====================================================================
+\begin{longtable}{@{}p{4.8cm} p{8.0cm}@{}}
+\toprule \textbf{File} & \textbf{Contents} \\ \midrule \endhead
+\code{results\_long.csv} & one row per dataset $\times$ model $\times$ seed \\
+\code{main\_results.csv} & average score per dataset $\times$ model \\
+\code{gap\_analysis.csv} & best-tree / best-raw-NN / best-TKCE, \% gap closed \\
+\code{twostage\_vs\_joint.csv} & the two TKCE regimes head to head \\
+\code{kernel\_ablation.csv} & GBT vs Mondrian kernel \\
+\code{avg\_rank.csv}, \code{ranks.csv} & average and per-dataset ranks \\
+\code{wilcoxon.csv} & significance tests vs a reference model \\
+\code{cd\_diagram.png} & critical-difference (rank) diagram \\
+\code{mechanism.png}, \code{data\_efficiency.png}, & analysis figures \\
+\code{lambda\_sweep.png}, \code{loss\_ablation.png} & \\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\section{Compute Estimates}
+% =====================================================================
+Tuning happens once per dataset (16 models $\times$ 100 trials); extra seeds are
+cheap. Roughly: \textbf{Colab free} (2 CPUs) $\sim$6–8\,h/dataset (full suite
+infeasible; use for a small pass). \textbf{Colab Pro+} (T4/L4 GPU, 24\,h
+background) $\sim$2–3\,h/dataset $\Rightarrow$ the 15-dataset subset $\approx$
+\textbf{35–40\,h} over $\sim$2–3 sessions. FT-Transformer is the heaviest model;
+prefer T4/L4 over A100 (mostly CPU-bound; A100 spends the 500 monthly units
+fastest).
+
+% =====================================================================
+\section{Framework Code Map}
+% =====================================================================
+\begin{longtable}{@{}p{3.6cm} p{9.0cm}@{}}
+\toprule \textbf{Path} & \textbf{Purpose} \\ \midrule \endhead
+\code{tkce/data.py} & load datasets, preprocess, split \\
+\code{tkce/kernels.py} & GBT / Random-Forest / Mondrian tree kernels \\
+\code{tkce/models.py} & encoder, MLP / TabResNet heads, FT-Transformer, NumEmbedMLP, joint model \\
+\code{tkce/losses.py} & the 7 contrastive losses \\
+\code{tkce/pairs.py} & mine similar pairs from the kernel \\
+\code{tkce/train.py} & two-stage and joint training \\
+\code{tkce/baselines.py} & tree baselines, leaf-one-hot, PCA-of-leaf \\
+\code{tkce/metrics.py} & AUC / accuracy / RMSE / $R^2$ \\
+\code{tkce/tuning.py} & tuning knobs + 16-model registry \\
+\code{tkce/aggregate.py} & ranks, CD diagram, Wilcoxon \\
+\code{tkce/analysis.py} & synthetic data + perturbations for analyses \\
+\code{run\_slice.py}, \code{run\_suite.py} & one-dataset / full drivers \\
+\code{make\_report.py} & results $\to$ paper tables and figures \\
+\code{run\_mechanism.py}, \dots & the four analysis experiments \\
+\bottomrule
+\end{longtable}
+
+\end{document}
