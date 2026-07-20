@@ -1,22 +1,29 @@
-"""Deep TKCE-joint training-dynamics study over MULTIPLE SHUFFLES of one dataset.
+"""Deep TKCE-joint study: LOSSES x SHUFFLES on one balanced classification dataset.
 
-Purpose: take a single balanced binary dataset, make the Siamese encoder and the
-TabResNet head much DEEPER, train for many epochs with a SLOW learning rate and
-NO early stopping, and do this over several random train/val/test SHUFFLES.
+Deep Siamese encoder + deep TabResNet, many epochs, slow learning rate, NO early
+stopping. Sweeps several contrastive losses, and repeats each over several random
+train/val/test shuffles, so you can see:
 
-This answers two questions at once:
-  1. How do loss / AUC / accuracy evolve per epoch on train vs validation?
-  2. Is the test score a genuine ceiling for this dataset, or an artifact of one
-     lucky/unlucky split? (Each shuffle re-splits the data with a new seed.)
+  * which contrastive loss gives the best downstream score,
+  * whether the test score is a genuine ceiling or a lucky/unlucky split,
+  * how loss / AUC / accuracy evolve per epoch on train vs validation,
+  * how badly the contrastive term dominates the fused loss (per loss, since the
+    losses have very different natural magnitudes).
 
-Outputs:
-  <csv>/deep_joint_<data>_epochs.csv  per-epoch metrics for every shuffle
-  <csv>/deep_joint_<data>_test.csv    final test metrics per shuffle
-  <out>/deep_joint_<data>.png         4 panels: loss, AUC, accuracy (mean +/- band
-                                      across shuffles) and per-shuffle test AUC
+NOTE: the joint regime supports the in-batch anchor/positive family only
+(infonce, aninfonce, clip_infonce, contrastive, triplet). `supcon` and
+`kernel_regression` need different batch structures and are two-stage only; if
+passed they are skipped with a message.
+
+Outputs (in <csv> / <out>):
+  deep_joint_<data>_epochs.csv  per-epoch metrics for every (loss, shuffle)
+  deep_joint_<data>_test.csv    final test metrics for every (loss, shuffle)
+  deep_joint_<data>.png         6-panel comparison figure
 
 Usage:
-  python run_deep_joint.py --task 361070 --seeds 0,1,2,3,4 --epochs 600 --lr 1e-4
+  python run_deep_joint.py --task 361070 --seeds 0,1,2 \
+      --losses infonce,aninfonce,clip_infonce,contrastive,triplet \
+      --epochs 600 --lr 1e-4
 """
 
 from __future__ import annotations
@@ -41,6 +48,8 @@ from tkce.models import JointModel, SiameseEncoder, build_head, head_out_dim
 from tkce.pairs import AnchorPositiveDataset, SampledPositiveIndex
 from tkce.train import resolve_device
 
+JOINT_LOSSES = ["infonce", "aninfonce", "clip_infonce", "contrastive", "triplet"]
+
 
 def _cycle(loader):
     while True:
@@ -50,7 +59,6 @@ def _cycle(loader):
 
 @torch.no_grad()
 def _eval_split(model, X, y, device, batch_size=4096):
-    """Return (cross-entropy loss, AUC, accuracy) on a split."""
     model.eval()
     tot, probas = 0.0, []
     for s in range(0, len(X), batch_size):
@@ -63,11 +71,10 @@ def _eval_split(model, X, y, device, batch_size=4096):
     return tot / len(X), m["auc"], m["accuracy"]
 
 
-def run_one_shuffle(seed, args, device):
-    """Train the deep joint model on ONE random split. Returns (history, test)."""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    ds = load_task(args.task, seed=seed, max_rows=args.max_rows)   # new shuffle
+def run_one(loss_name, seed, args, device):
+    """Train the deep joint model with one loss on one shuffle."""
+    torch.manual_seed(seed); np.random.seed(seed)
+    ds = load_task(args.task, seed=seed, max_rows=args.max_rows)
     if ds.task_type != "classification":
         raise SystemExit(f"{ds.name} is not a classification dataset.")
 
@@ -80,9 +87,13 @@ def run_one_shuffle(seed, args, device):
     head = build_head(args.head, args.embedding_dim, head_out_dim(ds), head_cfg).to(device)
     model = JointModel(enc, head).to(device)
 
-    contrast, _ = build_contrastive(args.contrastive_loss, args.temperature,
-                                    dim=args.embedding_dim)
+    contrast, regime = build_contrastive(loss_name, args.temperature,
+                                         dim=args.embedding_dim, margin=args.margin)
+    if regime != "anchorpos":
+        raise ValueError(f"'{loss_name}' is not supported in the joint regime "
+                         f"(two-stage only)")
     contrast = contrast.to(device)
+
     kern = build_kernel("gbt", ds.X_train, ds.y_train, ds.task_type,
                         {"n_estimators": args.k_n_estimators,
                          "max_depth": args.k_max_depth, "random_state": seed})
@@ -101,31 +112,24 @@ def run_one_shuffle(seed, args, device):
                       torch.from_numpy(ds.y_train).to(device)),
         batch_size=args.batch_size, shuffle=True)
 
-    # ---- loss balancing: measure the two losses' starting magnitudes ----
-    lam_eff = args.lambda_contrast
-    t0 = c0 = float("nan")
+    # measure starting magnitudes -> optional auto-balance of the fused loss
+    lam_eff, t0, c0 = args.lambda_contrast, float("nan"), float("nan")
     with torch.no_grad():
         xb0, yb0 = next(iter(sup_loader))
         t0 = F.cross_entropy(model(xb0)[0], yb0).item()
         if ap_gen is not None:
             xi0, xj0 = next(ap_gen)
-            c0 = apply_pair_loss(args.contrastive_loss, contrast,
+            c0 = apply_pair_loss(loss_name, contrast,
                                  enc(xi0.to(device)), enc(xj0.to(device))).item()
     if args.balance_losses and np.isfinite(c0) and c0 > 1e-8:
         lam_eff = args.lambda_contrast * (t0 / c0)
-
-    print(f"[shuffle seed={seed}] {ds.name}: train={len(ds.X_train)} "
-          f"val={len(ds.X_val)} test={len(ds.X_test)} | anchors with positives="
-          f"{len(ap_ds)}/{idx.n}", flush=True)
-    print(f"  initial magnitudes: task={t0:.3f}  contrastive={c0:.3f}  "
-          f"(ratio {c0 / max(t0, 1e-8):.1f}x) -> lambda_effective={lam_eff:.4f}"
-          f"{'  [auto-balanced]' if args.balance_losses else ''}", flush=True)
+    print(f"  [{loss_name} | seed {seed}] task0={t0:.3f} contrastive0={c0:.3f} "
+          f"(ratio {c0/max(t0,1e-8):.1f}x) lambda_eff={lam_eff:.4f}", flush=True)
 
     hist = []
     for epoch in range(1, args.epochs + 1):
         model.train()
-        task_sum = con_sum = 0.0
-        nb = 0
+        task_sum = con_sum = 0.0; nb = 0
         for xb, yb in sup_loader:
             opt.zero_grad()
             out, _ = model(xb)
@@ -133,7 +137,7 @@ def run_one_shuffle(seed, args, device):
             loss, c_val = t_loss, 0.0
             if ap_gen is not None:
                 xi, xj = next(ap_gen)
-                c_loss = apply_pair_loss(args.contrastive_loss, contrast,
+                c_loss = apply_pair_loss(loss_name, contrast,
                                          enc(xi.to(device)), enc(xj.to(device)))
                 loss = loss + lam_eff * c_loss
                 c_val = c_loss.item()
@@ -142,34 +146,35 @@ def run_one_shuffle(seed, args, device):
 
         tr_loss, tr_auc, tr_acc = _eval_split(model, ds.X_train, ds.y_train, device)
         va_loss, va_auc, va_acc = _eval_split(model, ds.X_val, ds.y_val, device)
-        hist.append(dict(seed=seed, epoch=epoch, lam_eff=lam_eff,
+        hist.append(dict(loss=loss_name, seed=seed, epoch=epoch, lam_eff=lam_eff,
                          batch_task_loss=task_sum / nb,
                          batch_contrastive_loss=con_sum / nb,
                          weighted_contrastive=lam_eff * con_sum / nb,
                          train_loss=tr_loss, val_loss=va_loss,
                          train_auc=tr_auc, val_auc=va_auc,
                          train_acc=tr_acc, val_acc=va_acc))
-        if epoch % max(1, args.epochs // 10) == 0 or epoch == 1:
-            print(f"  [seed {seed}] epoch {epoch:4d}/{args.epochs} "
-                  f"train_auc={tr_auc:.4f} val_auc={va_auc:.4f} "
-                  f"val_loss={va_loss:.4f}", flush=True)
+        if epoch % max(1, args.epochs // 6) == 0:
+            print(f"    epoch {epoch:4d}/{args.epochs} train_auc={tr_auc:.4f} "
+                  f"val_auc={va_auc:.4f}", flush=True)
 
     te_loss, te_auc, te_acc = _eval_split(model, ds.X_test, ds.y_test, device)
     h = pd.DataFrame(hist)
     best = h.loc[h.val_auc.idxmax()]
-    test = dict(seed=seed, dataset=ds.name, test_auc=te_auc, test_acc=te_acc,
-                test_loss=te_loss, best_val_auc=best.val_auc,
-                best_val_epoch=int(best.epoch))
-    print(f"  [seed {seed}] TEST auc={te_auc:.4f} acc={te_acc:.4f} "
-          f"(best val auc={best.val_auc:.4f} @ epoch {int(best.epoch)})\n", flush=True)
+    test = dict(loss=loss_name, seed=seed, dataset=ds.name, test_auc=te_auc,
+                test_acc=te_acc, test_loss=te_loss, train_auc_final=h.train_auc.iloc[-1],
+                best_val_auc=best.val_auc, best_val_epoch=int(best.epoch),
+                lam_eff=lam_eff, contrastive0=c0, task0=t0)
+    print(f"  [{loss_name} | seed {seed}] TEST auc={te_auc:.4f} acc={te_acc:.4f}\n",
+          flush=True)
     return h, test, ds.name
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", type=int, default=361070, help="balanced binary clf")
-    ap.add_argument("--seeds", default="0,1,2,3,4",
-                    help="comma-separated shuffles (each = a new random split)")
+    ap.add_argument("--task", type=int, default=361070)
+    ap.add_argument("--seeds", default="0,1,2", help="shuffles (new split each)")
+    ap.add_argument("--losses", default=",".join(JOINT_LOSSES),
+                    help="contrastive losses to compare (joint-compatible only)")
     ap.add_argument("--epochs", type=int, default=600)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--head", default="tabresnet", choices=["tabresnet", "mlp"])
@@ -183,11 +188,9 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--lambda-contrast", type=float, default=0.5)
     ap.add_argument("--balance-losses", action="store_true",
-                    help="rescale lambda so the task and contrastive terms START "
-                         "with equal magnitude (fixes the 'task loss is subdued' "
-                         "problem when InfoNCE is ~8x larger than cross-entropy)")
-    ap.add_argument("--contrastive-loss", default="infonce")
+                    help="rescale lambda per loss so task and contrastive start equal")
     ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--margin", type=float, default=1.0)
     ap.add_argument("--pos-threshold", type=float, default=0.6)
     ap.add_argument("--k-n-estimators", type=int, default=200)
     ap.add_argument("--k-max-depth", type=int, default=4)
@@ -200,103 +203,100 @@ def main():
     args = ap.parse_args()
 
     seeds = [int(s) for s in args.seeds.split(",")]
+    losses = [l.strip() for l in args.losses.split(",")]
     device = resolve_device(args.device)
     os.makedirs(args.out, exist_ok=True); os.makedirs(args.csv, exist_ok=True)
-    print(f"[deep] {len(seeds)} shuffles {seeds} | epochs={args.epochs} lr={args.lr} "
-          f"| encoder {args.enc_depth}x{args.enc_width} | {args.head} "
+    print(f"[deep] {len(losses)} losses x {len(seeds)} shuffles = "
+          f"{len(losses)*len(seeds)} runs | epochs={args.epochs} lr={args.lr} | "
+          f"encoder {args.enc_depth}x{args.enc_width} | {args.head} "
           f"n_blocks={args.n_blocks} | device={device}\n", flush=True)
 
     hists, tests, name = [], [], None
-    for s in seeds:
-        h, t, name = run_one_shuffle(s, args, device)
-        hists.append(h); tests.append(t)
+    for L in losses:
+        print(f"===== loss: {L} =====", flush=True)
+        for s in seeds:
+            try:
+                h, t, name = run_one(L, s, args, device)
+                hists.append(h); tests.append(t)
+            except ValueError as e:
+                print(f"  SKIP {L}: {e}\n", flush=True)
+                break
 
+    if not tests:
+        raise SystemExit("no runs completed")
     df = pd.concat(hists, ignore_index=True)
     tdf = pd.DataFrame(tests)
     df.to_csv(os.path.join(args.csv, f"deep_joint_{name}_epochs.csv"), index=False)
     tdf.to_csv(os.path.join(args.csv, f"deep_joint_{name}_test.csv"), index=False)
 
     # ---------------- summary ----------------
-    print("=" * 62)
-    print(f"TEST RESULTS ACROSS {len(seeds)} SHUFFLES — {name}")
-    print("=" * 62)
-    print(tdf[["seed", "test_auc", "test_acc", "best_val_auc", "best_val_epoch"]]
-          .to_string(index=False))
-    m, sd = tdf.test_auc.mean(), tdf.test_auc.std(ddof=0)
-    ma, sda = tdf.test_acc.mean(), tdf.test_acc.std(ddof=0)
-    print(f"\ntest AUC      : {m:.4f} +/- {sd:.4f}   "
-          f"(min {tdf.test_auc.min():.4f}, max {tdf.test_auc.max():.4f})")
-    print(f"test accuracy : {ma:.4f} +/- {sda:.4f}")
-    print("=> the spread across shuffles shows whether this is a real ceiling.")
+    summ = (tdf.groupby("loss")
+              .agg(test_auc_mean=("test_auc", "mean"), test_auc_std=("test_auc", "std"),
+                   test_acc_mean=("test_acc", "mean"), n=("test_auc", "size"),
+                   lam_eff=("lam_eff", "mean"), contrastive0=("contrastive0", "mean"))
+              .sort_values("test_auc_mean", ascending=False))
+    summ["test_auc_std"] = summ["test_auc_std"].fillna(0.0)
+    print("=" * 74)
+    print(f"TEST AUC BY LOSS ({len(seeds)} shuffles each) — {name}")
+    print("=" * 74)
+    print(summ.round(4).to_string())
+    print("\n(contrastive0 = the loss's natural magnitude at start; a big value "
+          "means\n it dominates the fused loss unless lambda is reduced.)")
 
     # ---------------- figure ----------------
-    g = df.groupby("epoch")
-    mean, std = g.mean(numeric_only=True), g.std(numeric_only=True).fillna(0.0)
-    e = mean.index
+    order = list(summ.index)
+    cmap = plt.get_cmap("tab10")
+    colors = {L: cmap(i % 10) for i, L in enumerate(order)}
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
 
-    def band(ax, col, label, color):
-        ax.plot(e, mean[col], label=label, color=color)
-        ax.fill_between(e, mean[col] - std[col], mean[col] + std[col],
-                        alpha=0.15, color=color)
+    # (a) headline: test AUC per loss
+    x = np.arange(len(order))
+    axes[0, 0].bar(x, summ.test_auc_mean, yerr=summ.test_auc_std, capsize=4,
+                   color=[colors[L] for L in order], edgecolor="white")
+    axes[0, 0].axhline(0.5, ls=":", c="grey", lw=1.2, label="random (0.5)")
+    axes[0, 0].set_xticks(x); axes[0, 0].set_xticklabels(order, rotation=25,
+                                                         ha="right", fontsize=8)
+    lo = max(0.0, min(0.48, (summ.test_auc_mean - summ.test_auc_std).min() - 0.03))
+    axes[0, 0].set_ylim(lo, min(1.0, (summ.test_auc_mean + summ.test_auc_std).max() + 0.03))
+    axes[0, 0].set_title(f"TEST AUC by contrastive loss\n(mean $\\pm$ std over "
+                         f"{len(seeds)} shuffles)")
+    axes[0, 0].set_ylabel("test AUC")
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 8.5))
+    def per_loss(ax, col, title, ylab):
+        for L in order:
+            g = df[df.loss == L].groupby("epoch")[col].mean()
+            ax.plot(g.index, g.values, label=L, color=colors[L], lw=1.4)
+        ax.set_title(title); ax.set_xlabel("epoch"); ax.set_ylabel(ylab)
 
-    # --- (a) TASK loss, own scale ---
-    band(axes[0, 0], "train_loss", "train", "tab:blue")
-    band(axes[0, 0], "val_loss", "validation", "tab:orange")
-    axes[0, 0].set_title("TASK loss (cross-entropy)")
-    axes[0, 0].set_xlabel("epoch"); axes[0, 0].set_ylabel("loss")
+    per_loss(axes[0, 1], "val_auc", "Validation AUC per epoch (mean over shuffles)", "AUC")
+    per_loss(axes[0, 2], "train_auc", "Train AUC per epoch (mean over shuffles)", "AUC")
+    per_loss(axes[1, 0], "train_loss", "TASK loss (train) per epoch", "cross-entropy")
+    per_loss(axes[1, 1], "batch_contrastive_loss",
+             "CONTRASTIVE loss (raw) per epoch\n(note the different natural scales)",
+             "loss")
 
-    # --- (b) CONTRASTIVE loss, own scale ---
-    band(axes[0, 1], "batch_contrastive_loss", "contrastive (raw)", "tab:green")
-    axes[0, 1].set_title("CONTRASTIVE loss (own scale)")
-    axes[0, 1].set_xlabel("epoch"); axes[0, 1].set_ylabel("loss")
-
-    # --- (c) the imbalance: what each term CONTRIBUTES to the total ---
-    band(axes[0, 2], "batch_task_loss", "task", "tab:orange")
-    band(axes[0, 2], "weighted_contrastive",
-         f"$\\lambda\\cdot$contrastive ($\\lambda$={df.lam_eff.iloc[0]:.3g})", "tab:green")
-    share = df.weighted_contrastive.mean() / max(
-        df.weighted_contrastive.mean() + df.batch_task_loss.mean(), 1e-9)
-    axes[0, 2].set_title(f"Contribution to the fused loss\n"
-                         f"(contrastive = {share:.0%} of total)")
-    axes[0, 2].set_xlabel("epoch"); axes[0, 2].set_ylabel("loss contribution")
-
-    band(axes[1, 0], "train_auc", "train", "tab:blue")
-    band(axes[1, 0], "val_auc", "validation", "tab:orange")
-    axes[1, 0].axhline(m, ls="--", c="tab:red", lw=1.4,
-                       label=f"mean TEST AUC = {m:.3f}")
-    axes[1, 0].set_title("AUC (mean $\\pm$ std over shuffles)")
-    axes[1, 0].set_xlabel("epoch"); axes[1, 0].set_ylabel("AUC")
-
-    band(axes[1, 1], "train_acc", "train", "tab:blue")
-    band(axes[1, 1], "val_acc", "validation", "tab:orange")
-    axes[1, 1].axhline(ma, ls="--", c="tab:red", lw=1.4,
-                       label=f"mean TEST acc = {ma:.3f}")
-    axes[1, 1].set_title("Accuracy (mean $\\pm$ std over shuffles)")
-    axes[1, 1].set_xlabel("epoch"); axes[1, 1].set_ylabel("accuracy")
-
-    axes[1, 2].bar(range(len(tdf)), tdf.test_auc, color="steelblue",
-                   edgecolor="white")
-    axes[1, 2].axhline(m, ls="--", c="tab:red", lw=1.4, label=f"mean {m:.3f}")
-    axes[1, 2].fill_between([-0.5, len(tdf) - 0.5], m - sd, m + sd,
-                            color="tab:red", alpha=0.12, label=f"$\\pm$ std {sd:.3f}")
-    axes[1, 2].axhline(0.5, ls=":", c="grey", lw=1.2, label="random (0.5)")
-    axes[1, 2].set_xticks(range(len(tdf)))
-    axes[1, 2].set_xticklabels([f"seed {s}" for s in tdf.seed], fontsize=8)
-    axes[1, 2].set_xlim(-0.5, len(tdf) - 0.5)
-    # adaptive limits so no bar is ever clipped
-    lo = max(0.0, min(0.48, tdf.test_auc.min() - 0.05))
-    hi = min(1.0, max(0.75, tdf.test_auc.max() + 0.05))
-    axes[1, 2].set_ylim(lo, hi)
-    axes[1, 2].set_title("Final TEST AUC per shuffle (is it a real ceiling?)")
-    axes[1, 2].set_ylabel("test AUC")
+    # (f) how much of the fused loss the contrastive term takes, per loss
+    shares = []
+    for L in order:
+        s = df[df.loss == L]
+        shares.append(s.weighted_contrastive.mean() /
+                      max(s.weighted_contrastive.mean() + s.batch_task_loss.mean(), 1e-9))
+    axes[1, 2].bar(x, shares, color=[colors[L] for L in order], edgecolor="white")
+    axes[1, 2].axhline(0.5, ls="--", c="tab:red", lw=1.3, label="equal contribution")
+    axes[1, 2].set_xticks(x); axes[1, 2].set_xticklabels(order, rotation=25,
+                                                         ha="right", fontsize=8)
+    axes[1, 2].set_ylim(0, 1)
+    axes[1, 2].set_title("Contrastive share of the fused loss\n"
+                         "(above the red line = task loss is subdued)")
+    axes[1, 2].set_ylabel("fraction of total loss")
 
     for a in axes.ravel():
-        a.grid(alpha=0.3); a.legend(fontsize=8)
-    fig.suptitle(f"Deep TKCE-joint on {name} — {len(seeds)} shuffles, "
-                 f"encoder {args.enc_depth}x{args.enc_width}, {args.head} "
-                 f"n_blocks={args.n_blocks}, lr={args.lr}, {args.epochs} epochs",
+        a.grid(alpha=0.3); a.legend(fontsize=7)
+    fig.suptitle(f"Deep TKCE-joint on {name} — {len(order)} losses x {len(seeds)} "
+                 f"shuffles | encoder {args.enc_depth}x{args.enc_width}, "
+                 f"{args.head} n_blocks={args.n_blocks}, lr={args.lr}, "
+                 f"{args.epochs} epochs"
+                 f"{' [balanced]' if args.balance_losses else ''}",
                  fontsize=12, fontweight="bold")
     fig.tight_layout()
     png = os.path.join(args.out, f"deep_joint_{name}.png")
