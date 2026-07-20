@@ -159,6 +159,38 @@ class CLIPInfoNCELoss(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Learned loss balancing (Kendall, Gal & Cipolla 2018)
+# --------------------------------------------------------------------------- #
+class UncertaintyWeighting(nn.Module):
+    r"""Learn how to weight several losses instead of hand-tuning $\lambda$.
+
+    Each task $i$ gets a learnable log-variance $s_i=\log\sigma_i^2$:
+
+        total = sum_i [ exp(-s_i) * L_i + s_i ]
+
+    The factor $\exp(-s_i)$ is the learned weight (a loss the model finds noisy
+    or hard gets down-weighted), while the additive $+s_i$ stops the weights
+    collapsing to zero. Initialised at $s_i=0$, i.e. every loss starts at
+    weight 1, and the balance is then learned jointly with the network.
+    """
+
+    def __init__(self, n_losses: int = 2):
+        super().__init__()
+        self.log_var = nn.Parameter(torch.zeros(n_losses))
+
+    def forward(self, losses):
+        total = 0.0
+        for i, L in enumerate(losses):
+            total = total + torch.exp(-self.log_var[i]) * L + self.log_var[i]
+        return total
+
+    @torch.no_grad()
+    def weights(self):
+        """Current effective weight of each loss, exp(-s_i)."""
+        return torch.exp(-self.log_var).detach().cpu().numpy()
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
 _ANCHORPOS = {"infonce", "aninfonce", "clip_infonce", "contrastive", "triplet"}

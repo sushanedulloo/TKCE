@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from tkce.data import load_task
 from tkce.kernels import build_kernel
-from tkce.losses import apply_pair_loss, build_contrastive
+from tkce.losses import UncertaintyWeighting, apply_pair_loss, build_contrastive
 from tkce.metrics import clf_metrics
 from tkce.models import JointModel, SiameseEncoder, build_head, head_out_dim
 from tkce.pairs import AnchorPositiveDataset, SampledPositiveIndex
@@ -105,8 +105,12 @@ def run_one(loss_name, seed, args, device):
         ap_gen = _cycle(DataLoader(ap_ds, batch_size=args.batch_size,
                                    shuffle=True, drop_last=False))
 
-    opt = torch.optim.AdamW(list(model.parameters()) + list(contrast.parameters()),
-                            lr=args.lr, weight_decay=args.weight_decay)
+    # learned loss balancing (the model decides the weights itself)
+    uw = UncertaintyWeighting(2).to(device) if args.uncertainty_weighting else None
+    params = list(model.parameters()) + list(contrast.parameters())
+    if uw is not None:
+        params += list(uw.parameters())
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     sup_loader = DataLoader(
         TensorDataset(torch.from_numpy(ds.X_train).to(device),
                       torch.from_numpy(ds.y_train).to(device)),
@@ -123,8 +127,11 @@ def run_one(loss_name, seed, args, device):
                                  enc(xi0.to(device)), enc(xj0.to(device))).item()
     if args.balance_losses and np.isfinite(c0) and c0 > 1e-8:
         lam_eff = args.lambda_contrast * (t0 / c0)
+    mode = ("uncertainty (learned)" if uw is not None else
+            "balanced" if args.balance_losses else "fixed lambda")
     print(f"  [{loss_name} | seed {seed}] task0={t0:.3f} contrastive0={c0:.3f} "
-          f"(ratio {c0/max(t0,1e-8):.1f}x) lambda_eff={lam_eff:.4f}", flush=True)
+          f"(ratio {c0/max(t0,1e-8):.1f}x) weighting={mode} "
+          f"lambda_eff={lam_eff:.4f}", flush=True)
 
     hist = []
     for epoch in range(1, args.epochs + 1):
@@ -139,17 +146,29 @@ def run_one(loss_name, seed, args, device):
                 xi, xj = next(ap_gen)
                 c_loss = apply_pair_loss(loss_name, contrast,
                                          enc(xi.to(device)), enc(xj.to(device)))
-                loss = loss + lam_eff * c_loss
                 c_val = c_loss.item()
+                loss = (uw([t_loss, c_loss]) if uw is not None
+                        else t_loss + lam_eff * c_loss)
+            elif uw is not None:
+                loss = uw([t_loss, t_loss.new_zeros(())])
             loss.backward(); opt.step()
             task_sum += t_loss.item(); con_sum += c_val; nb += 1
 
+        # effective weight of each loss this epoch
+        if uw is not None:
+            w_task, w_con = (float(v) for v in uw.weights())
+        else:
+            w_task, w_con = 1.0, lam_eff
+
         tr_loss, tr_auc, tr_acc = _eval_split(model, ds.X_train, ds.y_train, device)
         va_loss, va_auc, va_acc = _eval_split(model, ds.X_val, ds.y_val, device)
+        wt, wc = w_task * task_sum / nb, w_con * con_sum / nb
         hist.append(dict(loss=loss_name, seed=seed, epoch=epoch, lam_eff=lam_eff,
+                         w_task=w_task, w_contrastive=w_con,
                          batch_task_loss=task_sum / nb,
                          batch_contrastive_loss=con_sum / nb,
-                         weighted_contrastive=lam_eff * con_sum / nb,
+                         weighted_task=wt, weighted_contrastive=wc,
+                         contrastive_share=wc / max(wt + wc, 1e-9),
                          train_loss=tr_loss, val_loss=va_loss,
                          train_auc=tr_auc, val_auc=va_auc,
                          train_acc=tr_acc, val_acc=va_acc))
@@ -163,7 +182,10 @@ def run_one(loss_name, seed, args, device):
     test = dict(loss=loss_name, seed=seed, dataset=ds.name, test_auc=te_auc,
                 test_acc=te_acc, test_loss=te_loss, train_auc_final=h.train_auc.iloc[-1],
                 best_val_auc=best.val_auc, best_val_epoch=int(best.epoch),
-                lam_eff=lam_eff, contrastive0=c0, task0=t0)
+                lam_eff=lam_eff, contrastive0=c0, task0=t0,
+                final_w_task=h.w_task.iloc[-1],
+                final_w_contrastive=h.w_contrastive.iloc[-1],
+                final_contrastive_share=h.contrastive_share.iloc[-1])
     print(f"  [{loss_name} | seed {seed}] TEST auc={te_auc:.4f} acc={te_acc:.4f}\n",
           flush=True)
     return h, test, ds.name
@@ -189,6 +211,9 @@ def main():
     ap.add_argument("--lambda-contrast", type=float, default=0.5)
     ap.add_argument("--balance-losses", action="store_true",
                     help="rescale lambda per loss so task and contrastive start equal")
+    ap.add_argument("--uncertainty-weighting", action="store_true",
+                    help="LET THE MODEL LEARN THE BALANCE (Kendall et al. 2018): a "
+                         "trainable weight per loss instead of a hand-set lambda")
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--margin", type=float, default=1.0)
     ap.add_argument("--pos-threshold", type=float, default=0.6)
@@ -233,7 +258,10 @@ def main():
     summ = (tdf.groupby("loss")
               .agg(test_auc_mean=("test_auc", "mean"), test_auc_std=("test_auc", "std"),
                    test_acc_mean=("test_acc", "mean"), n=("test_auc", "size"),
-                   lam_eff=("lam_eff", "mean"), contrastive0=("contrastive0", "mean"))
+                   contrastive0=("contrastive0", "mean"),
+                   w_task=("final_w_task", "mean"),
+                   w_contrastive=("final_w_contrastive", "mean"),
+                   contrastive_share=("final_contrastive_share", "mean"))
               .sort_values("test_auc_mean", ascending=False))
     summ["test_auc_std"] = summ["test_auc_std"].fillna(0.0)
     print("=" * 74)
@@ -275,20 +303,15 @@ def main():
              "CONTRASTIVE loss (raw) per epoch\n(note the different natural scales)",
              "loss")
 
-    # (f) how much of the fused loss the contrastive term takes, per loss
-    shares = []
-    for L in order:
-        s = df[df.loss == L]
-        shares.append(s.weighted_contrastive.mean() /
-                      max(s.weighted_contrastive.mean() + s.batch_task_loss.mean(), 1e-9))
-    axes[1, 2].bar(x, shares, color=[colors[L] for L in order], edgecolor="white")
+    # (f) contrastive share of the fused loss, per epoch (works for every mode;
+    #     with uncertainty weighting this is the balance the MODEL learned)
+    per_loss(axes[1, 2], "contrastive_share",
+             ("Learned balance: contrastive share of fused loss"
+              if args.uncertainty_weighting else
+              "Contrastive share of the fused loss"),
+             "fraction of total loss")
     axes[1, 2].axhline(0.5, ls="--", c="tab:red", lw=1.3, label="equal contribution")
-    axes[1, 2].set_xticks(x); axes[1, 2].set_xticklabels(order, rotation=25,
-                                                         ha="right", fontsize=8)
     axes[1, 2].set_ylim(0, 1)
-    axes[1, 2].set_title("Contrastive share of the fused loss\n"
-                         "(above the red line = task loss is subdued)")
-    axes[1, 2].set_ylabel("fraction of total loss")
 
     for a in axes.ravel():
         a.grid(alpha=0.3); a.legend(fontsize=7)
