@@ -104,9 +104,12 @@ def run_one(loss_name, lam, seed, args, device):
     idx = SampledPositiveIndex(kern, kern.leaves(ds.X_train),
                                pos_threshold=args.pos_threshold, max_pos=50, seed=seed)
     ap_ds = AnchorPositiveDataset(ds.X_train, idx, seed=seed)
+    # the contrastive pairs get their OWN (larger) batch so InfoNCE keeps plenty
+    # of in-batch negatives even when the supervised batch is small
+    cbs = args.contrastive_batch_size or args.batch_size
     ap_gen = None
     if len(ap_ds) > 0 and lam > 0:
-        ap_gen = _cycle(DataLoader(ap_ds, batch_size=args.batch_size,
+        ap_gen = _cycle(DataLoader(ap_ds, batch_size=cbs,
                                    shuffle=True, drop_last=False))
 
     uw = UncertaintyWeighting(2).to(device) if args.uncertainty_weighting else None
@@ -134,7 +137,9 @@ def run_one(loss_name, lam, seed, args, device):
             "balanced" if args.balance_losses else "fixed")
     print(f"  [{loss_name} | lam={lam:g} | seed {seed}] task0={t0:.3f} "
           f"contrastive0={c0:.3f} (ratio {c0/max(t0,1e-8):.1f}x) "
-          f"weighting={mode} lambda_eff={lam_eff:.5f}", flush=True)
+          f"weighting={mode} lambda_eff={lam_eff:.5f} | "
+          f"batch task={args.batch_size} contrastive={cbs} "
+          f"({2*cbs-2} in-batch negatives)", flush=True)
 
     hist = []
     for epoch in range(1, args.epochs + 1):
@@ -200,7 +205,13 @@ def main():
     ap.add_argument("--epochs", type=int, default=600)
     ap.add_argument("--lr", type=float, default=1e-6,
                     help="slow LR; raise only if training is too flat")
-    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--batch-size", type=int, default=64,
+                    help="batch for the TASK loss; small = more updates + more "
+                         "gradient noise (regularisation) on a small dataset")
+    ap.add_argument("--contrastive-batch-size", type=int, default=None,
+                    help="separate batch for the CONTRASTIVE pairs. InfoNCE learns "
+                         "from in-batch negatives, so keep this LARGE (e.g. 256) "
+                         "even when --batch-size is small. Defaults to --batch-size.")
     ap.add_argument("--head", default="tabresnet", choices=["tabresnet", "mlp"])
     ap.add_argument("--enc-width", type=int, default=512)
     ap.add_argument("--enc-depth", type=int, default=6)
@@ -234,7 +245,9 @@ def main():
 
     print(f"[deep] {len(losses)} loss(es) x {len(lambdas)} lambda(s) x {len(seeds)} "
           f"shuffles = {len(losses)*len(lambdas)*len(seeds)} runs")
-    print(f"[deep] epochs={args.epochs}  lr={args.lr:g}  BATCH SIZE={args.batch_size}  "
+    cbs = args.contrastive_batch_size or args.batch_size
+    print(f"[deep] epochs={args.epochs}  lr={args.lr:g}  "
+          f"BATCH(task)={args.batch_size}  BATCH(contrastive)={cbs}  "
           f"encoder={args.enc_depth}x{args.enc_width}  {args.head}"
           f"(n_blocks={args.n_blocks})  device={device}\n", flush=True)
 
@@ -333,7 +346,8 @@ def main():
     for a in axes.ravel():
         a.grid(alpha=0.3); a.legend(fontsize=7)
     fig.suptitle(f"Deep TKCE-joint on {name} — {len(seeds)} shuffles | "
-                 f"batch={args.batch_size}, lr={args.lr:g}, {args.epochs} epochs | "
+                 f"batch task={args.batch_size}/contrastive={cbs}, "
+                 f"lr={args.lr:g}, {args.epochs} epochs | "
                  f"encoder {args.enc_depth}x{args.enc_width}, {args.head} "
                  f"n_blocks={args.n_blocks}"
                  f"{' [balanced]' if args.balance_losses else ''}"
