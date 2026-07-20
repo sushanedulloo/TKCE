@@ -101,9 +101,25 @@ def run_one_shuffle(seed, args, device):
                       torch.from_numpy(ds.y_train).to(device)),
         batch_size=args.batch_size, shuffle=True)
 
+    # ---- loss balancing: measure the two losses' starting magnitudes ----
+    lam_eff = args.lambda_contrast
+    t0 = c0 = float("nan")
+    with torch.no_grad():
+        xb0, yb0 = next(iter(sup_loader))
+        t0 = F.cross_entropy(model(xb0)[0], yb0).item()
+        if ap_gen is not None:
+            xi0, xj0 = next(ap_gen)
+            c0 = apply_pair_loss(args.contrastive_loss, contrast,
+                                 enc(xi0.to(device)), enc(xj0.to(device))).item()
+    if args.balance_losses and np.isfinite(c0) and c0 > 1e-8:
+        lam_eff = args.lambda_contrast * (t0 / c0)
+
     print(f"[shuffle seed={seed}] {ds.name}: train={len(ds.X_train)} "
           f"val={len(ds.X_val)} test={len(ds.X_test)} | anchors with positives="
           f"{len(ap_ds)}/{idx.n}", flush=True)
+    print(f"  initial magnitudes: task={t0:.3f}  contrastive={c0:.3f}  "
+          f"(ratio {c0 / max(t0, 1e-8):.1f}x) -> lambda_effective={lam_eff:.4f}"
+          f"{'  [auto-balanced]' if args.balance_losses else ''}", flush=True)
 
     hist = []
     for epoch in range(1, args.epochs + 1):
@@ -119,16 +135,17 @@ def run_one_shuffle(seed, args, device):
                 xi, xj = next(ap_gen)
                 c_loss = apply_pair_loss(args.contrastive_loss, contrast,
                                          enc(xi.to(device)), enc(xj.to(device)))
-                loss = loss + args.lambda_contrast * c_loss
+                loss = loss + lam_eff * c_loss
                 c_val = c_loss.item()
             loss.backward(); opt.step()
             task_sum += t_loss.item(); con_sum += c_val; nb += 1
 
         tr_loss, tr_auc, tr_acc = _eval_split(model, ds.X_train, ds.y_train, device)
         va_loss, va_auc, va_acc = _eval_split(model, ds.X_val, ds.y_val, device)
-        hist.append(dict(seed=seed, epoch=epoch,
+        hist.append(dict(seed=seed, epoch=epoch, lam_eff=lam_eff,
                          batch_task_loss=task_sum / nb,
                          batch_contrastive_loss=con_sum / nb,
+                         weighted_contrastive=lam_eff * con_sum / nb,
                          train_loss=tr_loss, val_loss=va_loss,
                          train_auc=tr_auc, val_auc=va_auc,
                          train_acc=tr_acc, val_acc=va_acc))
@@ -165,6 +182,10 @@ def main():
     ap.add_argument("--n-blocks", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--lambda-contrast", type=float, default=0.5)
+    ap.add_argument("--balance-losses", action="store_true",
+                    help="rescale lambda so the task and contrastive terms START "
+                         "with equal magnitude (fixes the 'task loss is subdued' "
+                         "problem when InfoNCE is ~8x larger than cross-entropy)")
     ap.add_argument("--contrastive-loss", default="infonce")
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--pos-threshold", type=float, default=0.6)
@@ -218,42 +239,58 @@ def main():
         ax.fill_between(e, mean[col] - std[col], mean[col] + std[col],
                         alpha=0.15, color=color)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8.5))
 
+    # --- (a) TASK loss, own scale ---
     band(axes[0, 0], "train_loss", "train", "tab:blue")
     band(axes[0, 0], "val_loss", "validation", "tab:orange")
-    axes[0, 0].set_title("Task loss (cross-entropy)")
+    axes[0, 0].set_title("TASK loss (cross-entropy)")
     axes[0, 0].set_xlabel("epoch"); axes[0, 0].set_ylabel("loss")
 
-    band(axes[0, 1], "train_auc", "train", "tab:blue")
-    band(axes[0, 1], "val_auc", "validation", "tab:orange")
-    axes[0, 1].axhline(m, ls="--", c="tab:red", lw=1.4,
+    # --- (b) CONTRASTIVE loss, own scale ---
+    band(axes[0, 1], "batch_contrastive_loss", "contrastive (raw)", "tab:green")
+    axes[0, 1].set_title("CONTRASTIVE loss (own scale)")
+    axes[0, 1].set_xlabel("epoch"); axes[0, 1].set_ylabel("loss")
+
+    # --- (c) the imbalance: what each term CONTRIBUTES to the total ---
+    band(axes[0, 2], "batch_task_loss", "task", "tab:orange")
+    band(axes[0, 2], "weighted_contrastive",
+         f"$\\lambda\\cdot$contrastive ($\\lambda$={df.lam_eff.iloc[0]:.3g})", "tab:green")
+    share = df.weighted_contrastive.mean() / max(
+        df.weighted_contrastive.mean() + df.batch_task_loss.mean(), 1e-9)
+    axes[0, 2].set_title(f"Contribution to the fused loss\n"
+                         f"(contrastive = {share:.0%} of total)")
+    axes[0, 2].set_xlabel("epoch"); axes[0, 2].set_ylabel("loss contribution")
+
+    band(axes[1, 0], "train_auc", "train", "tab:blue")
+    band(axes[1, 0], "val_auc", "validation", "tab:orange")
+    axes[1, 0].axhline(m, ls="--", c="tab:red", lw=1.4,
                        label=f"mean TEST AUC = {m:.3f}")
-    axes[0, 1].set_title("AUC (mean $\\pm$ std over shuffles)")
-    axes[0, 1].set_xlabel("epoch"); axes[0, 1].set_ylabel("AUC")
+    axes[1, 0].set_title("AUC (mean $\\pm$ std over shuffles)")
+    axes[1, 0].set_xlabel("epoch"); axes[1, 0].set_ylabel("AUC")
 
-    band(axes[1, 0], "train_acc", "train", "tab:blue")
-    band(axes[1, 0], "val_acc", "validation", "tab:orange")
-    axes[1, 0].axhline(ma, ls="--", c="tab:red", lw=1.4,
+    band(axes[1, 1], "train_acc", "train", "tab:blue")
+    band(axes[1, 1], "val_acc", "validation", "tab:orange")
+    axes[1, 1].axhline(ma, ls="--", c="tab:red", lw=1.4,
                        label=f"mean TEST acc = {ma:.3f}")
-    axes[1, 0].set_title("Accuracy (mean $\\pm$ std over shuffles)")
-    axes[1, 0].set_xlabel("epoch"); axes[1, 0].set_ylabel("accuracy")
+    axes[1, 1].set_title("Accuracy (mean $\\pm$ std over shuffles)")
+    axes[1, 1].set_xlabel("epoch"); axes[1, 1].set_ylabel("accuracy")
 
-    axes[1, 1].bar(range(len(tdf)), tdf.test_auc, color="steelblue",
+    axes[1, 2].bar(range(len(tdf)), tdf.test_auc, color="steelblue",
                    edgecolor="white")
-    axes[1, 1].axhline(m, ls="--", c="tab:red", lw=1.4, label=f"mean {m:.3f}")
-    axes[1, 1].fill_between([-0.5, len(tdf) - 0.5], m - sd, m + sd,
+    axes[1, 2].axhline(m, ls="--", c="tab:red", lw=1.4, label=f"mean {m:.3f}")
+    axes[1, 2].fill_between([-0.5, len(tdf) - 0.5], m - sd, m + sd,
                             color="tab:red", alpha=0.12, label=f"$\\pm$ std {sd:.3f}")
-    axes[1, 1].axhline(0.5, ls=":", c="grey", lw=1.2, label="random (0.5)")
-    axes[1, 1].set_xticks(range(len(tdf)))
-    axes[1, 1].set_xticklabels([f"seed {s}" for s in tdf.seed], fontsize=8)
-    axes[1, 1].set_xlim(-0.5, len(tdf) - 0.5)
+    axes[1, 2].axhline(0.5, ls=":", c="grey", lw=1.2, label="random (0.5)")
+    axes[1, 2].set_xticks(range(len(tdf)))
+    axes[1, 2].set_xticklabels([f"seed {s}" for s in tdf.seed], fontsize=8)
+    axes[1, 2].set_xlim(-0.5, len(tdf) - 0.5)
     # adaptive limits so no bar is ever clipped
     lo = max(0.0, min(0.48, tdf.test_auc.min() - 0.05))
     hi = min(1.0, max(0.75, tdf.test_auc.max() + 0.05))
-    axes[1, 1].set_ylim(lo, hi)
-    axes[1, 1].set_title("Final TEST AUC per shuffle (is it a real ceiling?)")
-    axes[1, 1].set_ylabel("test AUC")
+    axes[1, 2].set_ylim(lo, hi)
+    axes[1, 2].set_title("Final TEST AUC per shuffle (is it a real ceiling?)")
+    axes[1, 2].set_ylabel("test AUC")
 
     for a in axes.ravel():
         a.grid(alpha=0.3); a.legend(fontsize=8)
