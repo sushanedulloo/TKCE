@@ -275,7 +275,7 @@ def main():
     order = list(summ.index)
     cmap = plt.get_cmap("tab10")
     colors = {L: cmap(i % 10) for i, L in enumerate(order)}
-    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 13))
 
     # (a) headline: test AUC per loss
     x = np.arange(len(order))
@@ -296,22 +296,27 @@ def main():
             ax.plot(g.index, g.values, label=L, color=colors[L], lw=1.4)
         ax.set_title(title); ax.set_xlabel("epoch"); ax.set_ylabel(ylab)
 
-    per_loss(axes[0, 1], "val_auc", "Validation AUC per epoch (mean over shuffles)", "AUC")
-    per_loss(axes[0, 2], "train_auc", "Train AUC per epoch (mean over shuffles)", "AUC")
-    per_loss(axes[1, 0], "train_loss", "TASK loss (train) per epoch", "cross-entropy")
-    per_loss(axes[1, 1], "batch_contrastive_loss",
-             "CONTRASTIVE loss (raw) per epoch\n(note the different natural scales)",
-             "loss")
+    # row 1: the two loss curves (task loss on train AND validation)
+    per_loss(axes[0, 1], "train_loss", "TASK loss — TRAIN", "cross-entropy")
+    per_loss(axes[0, 2], "val_loss", "TASK loss — VALIDATION", "cross-entropy")
+    # row 2: contrastive loss + AUC on train and validation
+    per_loss(axes[1, 0], "batch_contrastive_loss",
+             "CONTRASTIVE loss (raw)\n(note the different natural scales)", "loss")
+    per_loss(axes[1, 1], "train_auc", "AUC — TRAIN", "AUC")
+    per_loss(axes[1, 2], "val_auc", "AUC — VALIDATION", "AUC")
+    # row 3: accuracy on train and validation
+    per_loss(axes[2, 0], "train_acc", "Accuracy — TRAIN", "accuracy")
+    per_loss(axes[2, 1], "val_acc", "Accuracy — VALIDATION", "accuracy")
 
     # (f) contrastive share of the fused loss, per epoch (works for every mode;
     #     with uncertainty weighting this is the balance the MODEL learned)
-    per_loss(axes[1, 2], "contrastive_share",
+    per_loss(axes[2, 2], "contrastive_share",
              ("Learned balance: contrastive share of fused loss"
               if args.uncertainty_weighting else
               "Contrastive share of the fused loss"),
              "fraction of total loss")
-    axes[1, 2].axhline(0.5, ls="--", c="tab:red", lw=1.3, label="equal contribution")
-    axes[1, 2].set_ylim(0, 1)
+    axes[2, 2].axhline(0.5, ls="--", c="tab:red", lw=1.3, label="equal contribution")
+    axes[2, 2].set_ylim(0, 1)
 
     for a in axes.ravel():
         a.grid(alpha=0.3); a.legend(fontsize=7)
