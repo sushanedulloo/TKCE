@@ -162,9 +162,21 @@ def fit_joint(ds, args, device):
         raise SystemExit(f"'{args.loss}' is two-stage only; pick a joint loss.")
     contrast = contrast.to(device)
 
-    kern = build_kernel("gbt", ds.X_train, ds.y_train, ds.task_type,
-                        {"n_estimators": args.k_n_estimators,
-                         "max_depth": args.k_max_depth, "random_state": args.seed})
+    # Kernel source. GBT is a boosted (residual-fitting, shallow, correlated)
+    # ensemble; RF is bagged (independent, deep, class-pure leaves) — leaf
+    # co-occupancy is really Random-Forest *proximity*, so RF/Mondrian match the
+    # co-occupancy->Laplace theory that GBT does not. Swap here to test it.
+    if args.kernel == "rf":
+        kcfg = {"n_estimators": args.k_n_estimators, "max_depth": args.rf_max_depth,
+                "min_samples_leaf": args.rf_min_leaf, "random_state": args.seed}
+    elif args.kernel == "mondrian":
+        kcfg = {"n_estimators": args.k_n_estimators, "max_depth": args.mondrian_depth,
+                "random_state": args.seed}
+    else:  # gbt (boosting)
+        kcfg = {"n_estimators": args.k_n_estimators,
+                "max_depth": args.k_max_depth, "random_state": args.seed}
+    print(f"  [kernel] source={args.kernel}  cfg={kcfg}", flush=True)
+    kern = build_kernel(args.kernel, ds.X_train, ds.y_train, ds.task_type, kcfg)
     idx = SampledPositiveIndex(kern, kern.leaves(ds.X_train),
                                pos_threshold=args.pos_threshold, max_pos=50, seed=args.seed)
     ap_ds = AnchorPositiveDataset(ds.X_train, idx, seed=args.seed)
@@ -237,8 +249,18 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--margin", type=float, default=1.0)
     ap.add_argument("--pos-threshold", type=float, default=0.6)
+    ap.add_argument("--kernel", default="gbt", choices=["gbt", "rf", "mondrian"],
+                    help="kernel SOURCE: gbt=boosting (default); rf=Random Forest "
+                         "(bagged, deep, class-pure leaves = RF proximity); "
+                         "mondrian=unsupervised random partitions")
     ap.add_argument("--k-n-estimators", type=int, default=200)
-    ap.add_argument("--k-max-depth", type=int, default=4)
+    ap.add_argument("--k-max-depth", type=int, default=4, help="depth for the GBT kernel")
+    ap.add_argument("--rf-max-depth", type=int, default=None,
+                    help="depth for the RF kernel (default: unlimited/deep — the point of RF)")
+    ap.add_argument("--rf-min-leaf", type=int, default=5,
+                    help="min_samples_leaf for the RF kernel")
+    ap.add_argument("--mondrian-depth", type=int, default=6,
+                    help="depth for the Mondrian kernel")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     # ---- diagnostic knobs ----
     ap.add_argument("--diag-sample", type=int, default=2000,
@@ -258,7 +280,8 @@ def main():
     rng = np.random.default_rng(args.seed)
     C = ds.n_classes
     print(f"\n=== DIAGNOSIS: {ds.name} (task {args.task}) | "
-          f"{ds.n_features} feats, {C} classes | device={device} ===\n", flush=True)
+          f"{ds.n_features} feats, {C} classes | kernel={args.kernel} | "
+          f"device={device} ===\n", flush=True)
 
     # -------- ceiling: native tree(s) --------
     print("[ceiling] fitting tree baselines ...", flush=True)
@@ -399,6 +422,7 @@ def main():
     # -------- persist numbers --------
     summary = dict(
         dataset=ds.name, task=args.task, seed=args.seed, device=str(device),
+        kernel=args.kernel,
         tree_ceiling_auc=tree_auc, xgb_auc=xgb_te["auc"], lgb_auc=lgb_te["auc"],
         full_head_auc=full["auc"], full_head_acc=full["accuracy"],
         knn_on_K_auc=knnK["auc"], knn_on_phi_auc=knnPhi["auc"],
@@ -411,10 +435,10 @@ def main():
         biggest_drop=worst[0], biggest_drop_amount=worst[1],
         contrastive_loss_first=con_curve[0], contrastive_loss_last=con_curve[-1],
     )
-    with open(os.path.join(args.out, f"diag_{ds.name}.json"), "w") as f:
+    with open(os.path.join(args.out, f"diag_{ds.name}_{args.kernel}.json"), "w") as f:
         json.dump(summary, f, indent=2)
     pd.DataFrame(ladder, columns=["rung", "test_auc"]).to_csv(
-        os.path.join(args.out, f"diag_{ds.name}_ladder.csv"), index=False)
+        os.path.join(args.out, f"diag_{ds.name}_{args.kernel}_ladder.csv"), index=False)
 
     # -------- figure --------
     order = np.argsort(ys)                                 # sort matrices by label
@@ -496,14 +520,15 @@ def main():
     for i, v in enumerate(probe_vals):
         ax[2, 2].text(i, v + 0.003, f"{v:.3f}", ha="center", fontsize=8)
 
-    fig.suptitle(f"TKCE diagnosis — {ds.name} | full head AUC {full['auc']:.3f} "
+    fig.suptitle(f"TKCE diagnosis — {ds.name} [{args.kernel} kernel] | "
+                 f"full head AUC {full['auc']:.3f} "
                  f"vs tree {tree_auc:.3f} | biggest drop: {worst[0]}",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.98])
-    png = os.path.join(args.out, f"diag_{ds.name}.png")
+    png = os.path.join(args.out, f"diag_{ds.name}_{args.kernel}.png")
     fig.savefig(png, dpi=140, bbox_inches="tight")
     print(f"[diagnosis] figure  -> {png}")
-    print(f"[diagnosis] summary -> {args.out}/diag_{ds.name}.json (+ _ladder.csv)")
+    print(f"[diagnosis] summary -> {args.out}/diag_{ds.name}_{args.kernel}.json (+ _ladder.csv)")
 
 
 if __name__ == "__main__":
