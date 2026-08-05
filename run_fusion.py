@@ -164,6 +164,9 @@ def train_model(views, ds, enc, n_classes, args, device, label):
         for xb, tb, yb in loader:
             opt.zero_grad()
             loss = F.cross_entropy(model(xb, tb), yb)
+            if args.l1 > 0:                                   # L1 on weight matrices
+                loss = loss + args.l1 * sum(p.abs().sum()
+                                            for p in model.parameters() if p.ndim >= 2)
             loss.backward(); opt.step()
         tr = evaluate(model, ds.X_train, enc["train"], ds.y_train, device)
         va = evaluate(model, ds.X_val, enc["val"], ds.y_val, device)
@@ -215,6 +218,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--l1", type=float, default=0.0,
+                    help="L1 weight penalty (sparsity). Targets the big tree-encoding "
+                         "projection to prune useless split bits. Try 1e-5..1e-4.")
     # misc
     ap.add_argument("--ablation", action="store_true",
                     help="also run x+tree and x+deep to isolate each view")
@@ -230,6 +236,8 @@ def main():
     C = ds.n_classes
     print(f"\n=== FUSION: {ds.name} (task {args.task}) | {ds.n_features} feats, "
           f"{C} classes | fusion={args.fusion} | device={device} ===", flush=True)
+    print(f"[reg] lr={args.lr:g} batch={args.batch_size} dropout={args.dropout} "
+          f"weight_decay={args.weight_decay:g} l1={args.l1:g}", flush=True)
 
     # -------- view 2: RF split-direction encoding --------
     print(f"[view2] fitting encoding RF ({args.rf_trees} trees, depth {args.rf_depth}) ...",
@@ -284,6 +292,8 @@ def main():
 
     # -------- persist --------
     summary = dict(dataset=ds.name, task=args.task, seed=args.seed, fusion=args.fusion,
+                   lr=args.lr, batch_size=args.batch_size, dropout=args.dropout,
+                   weight_decay=args.weight_decay, l1=args.l1,
                    tree_ceiling=tree_ceiling, ceiling=ceil, tree_encoding_width=E,
                    results=results)
     with open(os.path.join(args.out, f"fusion_{ds.name}.json"), "w") as f:
