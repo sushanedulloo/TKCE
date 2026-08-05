@@ -40,6 +40,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,12 +129,17 @@ class FusionModel(nn.Module):
 @torch.no_grad()
 def evaluate(model, X, T, y, device, bs=8192):
     model.eval()
-    ps = []
+    ps, tot = [], 0.0
     for s in range(0, len(X), bs):
         xb = torch.from_numpy(X[s:s + bs]).to(device)
         tb = torch.from_numpy(T[s:s + bs]).to(device)
-        ps.append(F.softmax(model(xb, tb), dim=1).cpu().numpy())
-    return clf_metrics(y, np.concatenate(ps, axis=0))
+        yb = torch.from_numpy(y[s:s + bs]).to(device)
+        out = model(xb, tb)
+        tot += F.cross_entropy(out, yb, reduction="sum").item()
+        ps.append(F.softmax(out, dim=1).cpu().numpy())
+    m = clf_metrics(y, np.concatenate(ps, axis=0))
+    m["loss"] = tot / len(X)
+    return m
 
 
 def train_model(views, ds, enc, n_classes, args, device, label):
@@ -152,28 +158,34 @@ def train_model(views, ds, enc, n_classes, args, device, label):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
 
-    best_auc, best_state, best_ep = -1.0, None, 0
+    best_auc, best_state, best_ep, hist = -1.0, None, 0, []
     for epoch in range(1, args.epochs + 1):
         model.train()
         for xb, tb, yb in loader:
             opt.zero_grad()
             loss = F.cross_entropy(model(xb, tb), yb)
             loss.backward(); opt.step()
+        tr = evaluate(model, ds.X_train, enc["train"], ds.y_train, device)
         va = evaluate(model, ds.X_val, enc["val"], ds.y_val, device)
+        hist.append(dict(model=label, epoch=epoch,
+                         train_loss=tr["loss"], val_loss=va["loss"],
+                         train_auc=tr["auc"], val_auc=va["auc"],
+                         train_acc=tr["accuracy"], val_acc=va["accuracy"]))
         if va["auc"] > best_auc:
             best_auc, best_ep = va["auc"], epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if epoch % max(1, args.epochs // 8) == 0:
-            print(f"    epoch {epoch:4d}/{args.epochs}  val_auc={va['auc']:.4f}  "
-                  f"(best {best_auc:.4f} @ {best_ep})", flush=True)
+            print(f"    epoch {epoch:4d}/{args.epochs}  train_auc={tr['auc']:.4f}  "
+                  f"val_auc={va['auc']:.4f}  (best {best_auc:.4f} @ {best_ep})", flush=True)
 
     model.load_state_dict(best_state)
     te = evaluate(model, ds.X_test, enc["test"], ds.y_test, device)
     print(f"  -> {label:22s} TEST auc={te['auc']:.4f} acc={te['accuracy']:.4f} "
           f"(best val {best_auc:.4f} @ epoch {best_ep})", flush=True)
-    return dict(model=label, views="+".join(views), test_auc=te["auc"],
-                test_acc=te["accuracy"], best_val_auc=best_auc, best_epoch=best_ep,
-                concat_dim=model.cat_dim, params_M=round(n_par / 1e6, 2))
+    res = dict(model=label, views="+".join(views), test_auc=te["auc"],
+               test_acc=te["accuracy"], best_val_auc=best_auc, best_epoch=best_ep,
+               concat_dim=model.cat_dim, params_M=round(n_par / 1e6, 2))
+    return res, hist
 
 
 # --------------------------------------------------------------------------- #
@@ -246,10 +258,13 @@ def main():
         run_views = [["x"], ["x", "tree", "deep"]]
     labels = {"x": "raw (x only)", "x+tree": "x + tree", "x+deep": "x + deep",
               "x+tree+deep": "FULL (x+tree+deep)"}
-    results = []
+    results, hists = [], []
     for v in run_views:
         lab = labels["+".join(v)]
-        results.append(train_model(v, ds, enc, C, args, device, lab))
+        res, h = train_model(v, ds, enc, C, args, device, lab)
+        results.append(res); hists.extend(h)
+    hdf = pd.DataFrame(hists)
+    hdf.to_csv(os.path.join(args.out, f"fusion_{ds.name}_epochs.csv"), index=False)
 
     # -------- summary --------
     print("\n" + "=" * 64)
@@ -290,8 +305,36 @@ def main():
     fig.tight_layout()
     png = os.path.join(args.out, f"fusion_{ds.name}.png")
     fig.savefig(png, dpi=140, bbox_inches="tight")
-    print(f"\n[fusion] figure  -> {png}")
-    print(f"[fusion] summary -> {args.out}/fusion_{ds.name}.json")
+
+    # ---- training-curve figure: loss + AUC over epochs, all models overlaid ----
+    model_order = [r["model"] for r in results]
+    cmap = plt.get_cmap("tab10")
+    mcol = {m: cmap(i % 10) for i, m in enumerate(model_order)}
+    figc, axc = plt.subplots(2, 2, figsize=(15, 10))
+
+    def curve(ax, col, title, ylab, hline=None):
+        for m in model_order:
+            g = hdf[hdf.model == m]
+            ax.plot(g.epoch, g[col], color=mcol[m], lw=1.4, label=m)
+        if hline is not None:
+            ax.axhline(hline, ls="--", c="green", lw=1, alpha=0.6, label="tree ceiling")
+        ax.set_title(title); ax.set_xlabel("epoch"); ax.set_ylabel(ylab)
+        ax.grid(alpha=0.3); ax.legend(fontsize=7)
+
+    curve(axc[0, 0], "val_auc", "Validation AUC vs epoch", "AUC", tree_ceiling)
+    curve(axc[0, 1], "train_auc", "Train AUC vs epoch (overfitting gauge)", "AUC", tree_ceiling)
+    curve(axc[1, 0], "train_loss", "Train loss vs epoch", "cross-entropy")
+    curve(axc[1, 1], "val_loss", "Validation loss vs epoch (up = overfitting)", "cross-entropy")
+    figc.suptitle(f"Training curves — {ds.name} (fusion={args.fusion})",
+                  fontsize=13, fontweight="bold")
+    figc.tight_layout(rect=[0, 0, 1, 0.97])
+    cpng = os.path.join(args.out, f"fusion_{ds.name}_curves.png")
+    figc.savefig(cpng, dpi=140, bbox_inches="tight")
+
+    print(f"\n[fusion] bar chart    -> {png}")
+    print(f"[fusion] curves       -> {cpng}")
+    print(f"[fusion] epoch curves -> {args.out}/fusion_{ds.name}_epochs.csv")
+    print(f"[fusion] summary      -> {args.out}/fusion_{ds.name}.json")
 
 
 if __name__ == "__main__":
