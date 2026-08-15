@@ -33,7 +33,7 @@ from functools import lru_cache
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
 SUITES = {
@@ -118,8 +118,18 @@ class Dataset:
 # Loading + preprocessing
 # --------------------------------------------------------------------------- #
 def load_task(task_id: int, seed: int = 0, val_frac: float = 0.15,
-              test_frac: float = 0.15, max_rows: int | None = None) -> Dataset:
-    """Fetch an OpenML task and return a fully preprocessed `Dataset`."""
+              test_frac: float = 0.15, max_rows: int | None = None,
+              drop_cols: list | None = None,
+              group_col: str | None = None) -> Dataset:
+    """Fetch an OpenML task and return a fully preprocessed `Dataset`.
+
+    drop_cols : feature names removed from the inputs (e.g. leaky ID columns
+                like eye_movements' lineNo/assgNo/titleNo/wordNo).
+    group_col : if given, train/val/test are split so that no value of this
+                column is shared between splits (GroupShuffleSplit) — the fix
+                for grouped datasets where random splits leak near-duplicates.
+                The column may also appear in drop_cols (extracted first).
+    """
     import openml
 
     task = openml.tasks.get_task(task_id, download_splits=False)
@@ -137,6 +147,22 @@ def load_task(task_id: int, seed: int = 0, val_frac: float = 0.15,
     keep = y.notna().to_numpy()
     df, y = df.loc[keep].reset_index(drop=True), y.loc[keep].reset_index(drop=True)
 
+    # Group labels are captured BEFORE any column dropping.
+    groups = None
+    if group_col is not None:
+        if group_col not in df.columns:
+            raise ValueError(f"group_col '{group_col}' not among features {list(df.columns)}")
+        groups = pd.Series(df[group_col]).astype("category").cat.codes.to_numpy()
+
+    if drop_cols:
+        missing = [c for c in drop_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"drop_cols not found: {missing}")
+        keep_feat = [n not in set(drop_cols) for n in names]
+        cat_mask = cat_mask[np.asarray(keep_feat)]
+        names = [n for n, k in zip(names, keep_feat) if k]
+        df = df[names]
+
     num_cols = [c for c, is_cat in zip(names, cat_mask) if not is_cat]
     cat_cols = [c for c, is_cat in zip(names, cat_mask) if is_cat]
 
@@ -149,6 +175,8 @@ def load_task(task_id: int, seed: int = 0, val_frac: float = 0.15,
     if max_rows is not None and len(df) > max_rows:
         idx = np.random.default_rng(seed).choice(len(df), max_rows, replace=False)
         df, y = df.iloc[idx].reset_index(drop=True), y.iloc[idx].reset_index(drop=True)
+        if groups is not None:
+            groups = groups[idx]
 
     # Target encoding.
     if is_clf:
@@ -160,15 +188,23 @@ def load_task(task_id: int, seed: int = 0, val_frac: float = 0.15,
         n_classes = 1
         y_mean, y_std = float(np.mean(y_enc)), float(np.std(y_enc) + 1e-12)
 
-    # --- Split (stratified for classification) ---
+    # --- Split: grouped when group_col given, else stratified random ---
     idx_all = np.arange(len(df))
-    strat = y_enc if is_clf else None
-    idx_tr, idx_tmp = train_test_split(
-        idx_all, test_size=val_frac + test_frac, random_state=seed, stratify=strat)
-    strat_tmp = y_enc[idx_tmp] if is_clf else None
     rel = test_frac / (val_frac + test_frac)
-    idx_va, idx_te = train_test_split(
-        idx_tmp, test_size=rel, random_state=seed, stratify=strat_tmp)
+    if groups is not None:
+        gss = GroupShuffleSplit(n_splits=1, test_size=val_frac + test_frac,
+                                random_state=seed)
+        idx_tr, idx_tmp = next(gss.split(idx_all, y_enc, groups))
+        gss2 = GroupShuffleSplit(n_splits=1, test_size=rel, random_state=seed)
+        va_rel, te_rel = next(gss2.split(idx_tmp, y_enc[idx_tmp], groups[idx_tmp]))
+        idx_va, idx_te = idx_tmp[va_rel], idx_tmp[te_rel]
+    else:
+        strat = y_enc if is_clf else None
+        idx_tr, idx_tmp = train_test_split(
+            idx_all, test_size=val_frac + test_frac, random_state=seed, stratify=strat)
+        strat_tmp = y_enc[idx_tmp] if is_clf else None
+        idx_va, idx_te = train_test_split(
+            idx_tmp, test_size=rel, random_state=seed, stratify=strat_tmp)
 
     # --- Feature encoding, fit on TRAIN only ---
     # (a) numerical-encoded matrix: numerics scaled, categoricals -> ordinal ints.
@@ -229,5 +265,8 @@ def load_task(task_id: int, seed: int = 0, val_frac: float = 0.15,
         cat_mask=col_cat_mask, n_classes=n_classes,
         cat_cardinalities=cat_cardinalities, y_mean=y_mean, y_std=y_std,
         meta={"task_id": task_id, "n_num": len(num_cols), "n_cat": len(cat_cols),
-              "n_rows": len(df), "seed": seed},
+              "n_rows": len(df), "seed": seed,
+              "drop_cols": list(drop_cols) if drop_cols else [],
+              "group_col": group_col,
+              "split": "grouped" if groups is not None else "stratified_random"},
     )

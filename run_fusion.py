@@ -65,10 +65,16 @@ def fit_encoder_rf(X, y, args):
     return rf
 
 
-def split_direction_encoding(rf, X):
-    """For every internal split node across all trees: 1 if the sample would go
-    to the LEFT child (X[:, feature] <= threshold), else 0. Concatenated over
-    trees -> a dense binary matrix (n_samples, total_internal_nodes)."""
+def split_direction_encoding(rf, X, tau=0.0):
+    """For every internal split node across all trees: does the sample go LEFT?
+
+    tau == 0 : hard bits, 1[x_feat <= threshold]  (DeepTLF-style encoding)
+    tau  > 0 : SOFT bits, sigmoid((threshold - x_feat)/tau) — a temperature-
+               controlled relaxation of the fitted forest's routing. Features
+               are standardized upstream, so tau ~ 0.1-1.0 is a sensible range.
+               Soft bits carry "how close to the boundary" information and are
+               far less fingerprint-like than hard bits (anti-memorization).
+    """
     X = np.ascontiguousarray(X)
     cols = []
     for est in rf.estimators_:
@@ -76,9 +82,39 @@ def split_direction_encoding(rf, X):
         internal = np.where(t.feature >= 0)[0]          # split nodes only
         feats = t.feature[internal]
         thr = t.threshold[internal].astype(np.float32)
-        bits = (X[:, feats] <= thr).astype(np.float32)  # (n, n_internal)
-        cols.append(bits)
+        margin = thr - X[:, feats]                      # >0 means "goes left"
+        if tau > 0:
+            bits = 1.0 / (1.0 + np.exp(-margin / tau))
+        else:
+            bits = (margin >= 0)
+        cols.append(bits.astype(np.float32))
     return np.concatenate(cols, axis=1) if cols else np.zeros((len(X), 0), np.float32)
+
+
+def oob_honest_encoding(rf, enc_train, n_train):
+    """OOB-honest ("out-of-bag dropout") training encoding.
+
+    The forest was fit ON the training rows' labels, so a training row's bits
+    from trees whose bootstrap sample CONTAINED that row are contaminated: the
+    tree's splits were partly carved to classify that very row. Test rows have
+    no such trees — a distribution shift that lets the downstream net memorize.
+
+    Fix: for each training row keep only the bits from trees where the row was
+    OUT-OF-BAG (~37% of trees, honest by construction), zero the rest, and
+    rescale by T/|OOB| (inverted-dropout convention) so expected magnitudes
+    match the all-trees encoding used for val/test. Costs nothing: bootstrap
+    masks are a free by-product of the RF.
+    """
+    T = len(rf.estimators_)
+    inbag = np.zeros((n_train, T), dtype=bool)
+    for t, samp in enumerate(rf.estimators_samples_):
+        inbag[np.unique(samp), t] = True
+    oob = ~inbag
+    n_oob = oob.sum(axis=1).clip(min=1)
+    counts = [int((est.tree_.feature >= 0).sum()) for est in rf.estimators_]
+    colmask = np.repeat(oob, counts, axis=1).astype(np.float32)
+    scale = (T / n_oob).astype(np.float32)[:, None]
+    return enc_train * colmask * scale, float(n_oob.mean())
 
 
 # --------------------------------------------------------------------------- #
@@ -127,7 +163,7 @@ class FusionModel(nn.Module):
 # train / eval
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(model, X, T, y, device, bs=8192):
+def evaluate(model, X, T, y, device, bs=8192, return_proba=False):
     model.eval()
     ps, tot = [], 0.0
     for s in range(0, len(X), bs):
@@ -137,17 +173,20 @@ def evaluate(model, X, T, y, device, bs=8192):
         out = model(xb, tb)
         tot += F.cross_entropy(out, yb, reduction="sum").item()
         ps.append(F.softmax(out, dim=1).cpu().numpy())
-    m = clf_metrics(y, np.concatenate(ps, axis=0))
+    proba = np.concatenate(ps, axis=0)
+    m = clf_metrics(y, proba)
     m["loss"] = tot / len(X)
-    return m
+    return (m, proba) if return_proba else m
 
 
-def train_model(views, ds, enc, n_classes, args, device, label):
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+def train_one(views, ds, enc, n_classes, args, device, label, member=0):
+    seed = args.seed + 1000 * member
+    torch.manual_seed(seed); np.random.seed(seed)
     model = FusionModel(ds.n_features, enc["train"].shape[1], n_classes,
                         views, args).to(device)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"\n[{label}] views={views}  concat_dim={model.cat_dim}  params={n_par/1e6:.2f}M",
+    print(f"\n[{label}]{f' member {member+1}/{args.ensemble}' if args.ensemble > 1 else ''} "
+          f"views={views}  concat_dim={model.cat_dim}  params={n_par/1e6:.2f}M",
           flush=True)
 
     loader = DataLoader(
@@ -182,13 +221,40 @@ def train_model(views, ds, enc, n_classes, args, device, label):
                   f"val_auc={va['auc']:.4f}  (best {best_auc:.4f} @ {best_ep})", flush=True)
 
     model.load_state_dict(best_state)
-    te = evaluate(model, ds.X_test, enc["test"], ds.y_test, device)
+    te, te_proba = evaluate(model, ds.X_test, enc["test"], ds.y_test, device,
+                            return_proba=True)
     print(f"  -> {label:22s} TEST auc={te['auc']:.4f} acc={te['accuracy']:.4f} "
           f"(best val {best_auc:.4f} @ epoch {best_ep})", flush=True)
-    res = dict(model=label, views="+".join(views), test_auc=te["auc"],
-               test_acc=te["accuracy"], best_val_auc=best_auc, best_epoch=best_ep,
+    res = dict(model=label, views="+".join(views), member=member,
+               test_auc=te["auc"], test_acc=te["accuracy"],
+               best_val_auc=best_auc, best_epoch=best_ep,
                concat_dim=model.cat_dim, params_M=round(n_par / 1e6, 2))
-    return res, hist
+    return res, hist, te_proba
+
+
+def run_config(views, ds, enc, n_classes, args, device, label):
+    """Train `--ensemble` members (different seeds) and average their test
+    probabilities — a plain deep ensemble, the best-evidenced cheap
+    regularizer for tabular MLP-family models (cf. TabM)."""
+    members, hists, probs = [], [], []
+    for m in range(args.ensemble):
+        res, hist, p = train_one(views, ds, enc, n_classes, args, device,
+                                 label, member=m)
+        members.append(res); hists.extend(hist); probs.append(p)
+    if args.ensemble == 1:
+        return members[0], hists
+    em = clf_metrics(ds.y_test, np.mean(probs, axis=0))
+    res = dict(model=label, views="+".join(views),
+               test_auc=em["auc"], test_acc=em["accuracy"],
+               best_val_auc=float(np.mean([r["best_val_auc"] for r in members])),
+               best_epoch=int(np.mean([r["best_epoch"] for r in members])),
+               concat_dim=members[0]["concat_dim"],
+               params_M=members[0]["params_M"], ensemble=args.ensemble,
+               member_test_aucs=[round(r["test_auc"], 4) for r in members])
+    member_str = ", ".join(f"{r['test_auc']:.4f}" for r in members)
+    print(f"  => {label:22s} ENSEMBLE({args.ensemble}) TEST auc={em['auc']:.4f} "
+          f"acc={em['accuracy']:.4f}  (members: {member_str})", flush=True)
+    return res, hists
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +263,28 @@ def main():
     ap.add_argument("--task", type=int, default=361070)          # eye_movements
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-rows", type=int, default=16000)
+    # data hygiene (leak repair)
+    ap.add_argument("--drop-cols", default="",
+                    help="comma-separated feature names to REMOVE (leaky ID "
+                         "columns; eye_movements: lineNo,assgNo,titleNo,wordNo)")
+    ap.add_argument("--group-by", default="",
+                    help="feature name to GROUP the train/val/test split by "
+                         "(no group shared across splits; eye_movements: assgNo)")
+    # encoding options
+    ap.add_argument("--tau", type=float, default=0.0,
+                    help="soft-encoding temperature; 0 = hard bits, try 0.1-1.0 "
+                         "(features are standardized)")
+    ap.add_argument("--encoding", default="infold", choices=["infold", "oob"],
+                    help="infold = naive (forest saw the rows it encodes; leaks "
+                         "labels into train bits). oob = OOB-honest: train rows "
+                         "keep only bits from trees they were out-of-bag for")
+    # ensembling + run selection
+    ap.add_argument("--ensemble", type=int, default=1,
+                    help="train k members per config (different seeds) and "
+                         "average predictions (deep ensemble)")
+    ap.add_argument("--views", default="",
+                    help="semicolon-separated view configs to run, e.g. "
+                         "'x;x+tree'. Overrides --ablation. Empty = default set")
     # RF encoder (view 2) — depth is capped so the encoding width stays sane
     ap.add_argument("--rf-trees", type=int, default=100)
     ap.add_argument("--rf-depth", type=int, default=6,
@@ -230,25 +318,42 @@ def main():
 
     device = resolve_device(args.device)
     os.makedirs(args.out, exist_ok=True)
-    ds = load_task(args.task, seed=args.seed, max_rows=args.max_rows)
+    drop_cols = [c.strip() for c in args.drop_cols.split(",") if c.strip()] or None
+    group_col = args.group_by.strip() or None
+    ds = load_task(args.task, seed=args.seed, max_rows=args.max_rows,
+                   drop_cols=drop_cols, group_col=group_col)
     if ds.task_type != "classification":
         raise SystemExit(f"{ds.name} is not classification.")
     C = ds.n_classes
     print(f"\n=== FUSION: {ds.name} (task {args.task}) | {ds.n_features} feats, "
           f"{C} classes | fusion={args.fusion} | device={device} ===", flush=True)
+    print(f"[data] split={ds.meta['split']}"
+          f"{f' by {group_col}' if group_col else ''}"
+          f"{f' | dropped: {drop_cols}' if drop_cols else ''} | "
+          f"train={len(ds.y_train)} val={len(ds.y_val)} test={len(ds.y_test)}",
+          flush=True)
     print(f"[reg] lr={args.lr:g} batch={args.batch_size} dropout={args.dropout} "
-          f"weight_decay={args.weight_decay:g} l1={args.l1:g}", flush=True)
+          f"weight_decay={args.weight_decay:g} l1={args.l1:g} "
+          f"encoding={args.encoding} tau={args.tau:g} ensemble={args.ensemble}",
+          flush=True)
 
     # -------- view 2: RF split-direction encoding --------
     print(f"[view2] fitting encoding RF ({args.rf_trees} trees, depth {args.rf_depth}) ...",
           flush=True)
     rf = fit_encoder_rf(ds.X_train, ds.y_train, args)
-    enc = {"train": split_direction_encoding(rf, ds.X_train),
-           "val":   split_direction_encoding(rf, ds.X_val),
-           "test":  split_direction_encoding(rf, ds.X_test)}
+    enc = {"train": split_direction_encoding(rf, ds.X_train, args.tau),
+           "val":   split_direction_encoding(rf, ds.X_val, args.tau),
+           "test":  split_direction_encoding(rf, ds.X_test, args.tau)}
     E = enc["train"].shape[1]
     print(f"[view2] tree-encoding width = {E} split bits "
-          f"(~{E * enc['train'].shape[0] * 4 / 1e6:.0f} MB train)", flush=True)
+          f"({'hard' if args.tau == 0 else f'soft tau={args.tau:g}'}, "
+          f"~{E * enc['train'].shape[0] * 4 / 1e6:.0f} MB train)", flush=True)
+    if args.encoding == "oob":
+        enc["train"], mean_oob = oob_honest_encoding(rf, enc["train"],
+                                                     len(ds.y_train))
+        print(f"[view2] OOB-honest training encoding: each train row keeps bits "
+              f"from {mean_oob:.1f}/{args.rf_trees} trees on average "
+              f"(val/test keep all trees)", flush=True)
 
     # -------- tree ceiling (reference) --------
     print("[ceiling] fitting tree baselines ...", flush=True)
@@ -260,7 +365,9 @@ def main():
     tree_ceiling = max(ceil.values())
 
     # -------- neural runs --------
-    if args.ablation:
+    if args.views:
+        run_views = [v.strip().split("+") for v in args.views.split(";") if v.strip()]
+    elif args.ablation:
         run_views = [["x"], ["x", "tree"], ["x", "deep"], ["x", "tree", "deep"]]
     else:
         run_views = [["x"], ["x", "tree", "deep"]]
@@ -268,8 +375,8 @@ def main():
               "x+tree+deep": "FULL (x+tree+deep)"}
     results, hists = [], []
     for v in run_views:
-        lab = labels["+".join(v)]
-        res, h = train_model(v, ds, enc, C, args, device, lab)
+        lab = labels.get("+".join(v), "+".join(v))
+        res, h = run_config(v, ds, enc, C, args, device, lab)
         results.append(res); hists.extend(h)
     hdf = pd.DataFrame(hists)
     hdf.to_csv(os.path.join(args.out, f"fusion_{ds.name}_epochs.csv"), index=False)
@@ -280,20 +387,24 @@ def main():
     print("=" * 64)
     print(f"  {'tree ceiling':22s} {tree_ceiling:.4f}   "
           f"(xgb {ceil['xgboost']:.3f} / lgb {ceil['lightgbm']:.3f} / rf {ceil['random_forest']:.3f})")
+    best = max(results, key=lambda r: r["test_auc"])
     for r in sorted(results, key=lambda r: -r["test_auc"]):
-        star = "  <-- FULL" if r["views"] == "x+tree+deep" else ""
+        star = "  <-- best neural" if r is best else ""
         print(f"  {r['model']:22s} {r['test_auc']:.4f}   acc={r['test_acc']:.3f}{star}")
-    full = next(r for r in results if r["views"] == "x+tree+deep")
-    raw = next(r for r in results if r["views"] == "x")
-    print(f"\n  FULL vs raw-x baseline: {full['test_auc']:.4f} vs {raw['test_auc']:.4f} "
-          f"({full['test_auc'] - raw['test_auc']:+.4f})")
-    print(f"  FULL vs tree ceiling:   {full['test_auc']:.4f} vs {tree_ceiling:.4f} "
-          f"({full['test_auc'] - tree_ceiling:+.4f})")
+    raw = next((r for r in results if r["views"] == "x"), None)
+    if raw is not None and raw is not best:
+        print(f"\n  best neural vs raw-x:   {best['test_auc']:.4f} vs "
+              f"{raw['test_auc']:.4f} ({best['test_auc'] - raw['test_auc']:+.4f})")
+    print(f"  best neural vs ceiling: {best['test_auc']:.4f} vs {tree_ceiling:.4f} "
+          f"({best['test_auc'] - tree_ceiling:+.4f})")
 
     # -------- persist --------
     summary = dict(dataset=ds.name, task=args.task, seed=args.seed, fusion=args.fusion,
                    lr=args.lr, batch_size=args.batch_size, dropout=args.dropout,
                    weight_decay=args.weight_decay, l1=args.l1,
+                   encoding=args.encoding, tau=args.tau, ensemble=args.ensemble,
+                   drop_cols=drop_cols or [], group_by=group_col,
+                   split=ds.meta["split"],
                    tree_ceiling=tree_ceiling, ceiling=ceil, tree_encoding_width=E,
                    results=results)
     with open(os.path.join(args.out, f"fusion_{ds.name}.json"), "w") as f:
@@ -324,8 +435,8 @@ def main():
 
     def curve(ax, col, title, ylab, hline=None):
         for m in model_order:
-            g = hdf[hdf.model == m]
-            ax.plot(g.epoch, g[col], color=mcol[m], lw=1.4, label=m)
+            g = hdf[hdf.model == m].groupby("epoch")[col].mean()  # mean over members
+            ax.plot(g.index, g.values, color=mcol[m], lw=1.4, label=m)
         if hline is not None:
             ax.axhline(hline, ls="--", c="green", lw=1, alpha=0.6, label="tree ceiling")
         ax.set_title(title); ax.set_xlabel("epoch"); ax.set_ylabel(ylab)
