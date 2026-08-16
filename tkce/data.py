@@ -132,6 +132,11 @@ def load_task(task_id: int, seed: int = 0, val_frac: float = 0.15,
     """
     import openml
 
+    # openml.org 504s intermittently; retry politely instead of dying on the
+    # first hiccup. (A full outage still fails — use a cache bundle then.)
+    openml.config.retry_policy = "robot"
+    openml.config.connection_n_retries = 10
+
     task = openml.tasks.get_task(task_id, download_splits=False)
     ds = task.get_dataset()
     target = ds.default_target_attribute
