@@ -31,8 +31,10 @@ Colab (GPU):
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import re
 
 import matplotlib
 matplotlib.use("Agg")
@@ -51,6 +53,82 @@ from tkce.train import resolve_device
 
 LABELS = {"x": "raw (x only)", "x+tree": "x + tree",
           "x+tree+deep": "FULL (x+tree+deep)"}
+
+
+# --------------------------------------------------------------------------- #
+# checkpointing (survives a Colab disconnect; keeps only the newest file)
+# --------------------------------------------------------------------------- #
+def _ckpt_list(ckpt_dir, ds_name, key):
+    """Existing checkpoints for this (dataset, view-config), oldest -> newest."""
+    pat = os.path.join(ckpt_dir, f"ckpt_{ds_name}_{key}_ep*.pt")
+    found = []
+    for p in glob.glob(pat):
+        m = re.search(r"_ep(\d+)\.pt$", p)
+        if m:
+            found.append((int(m.group(1)), p))
+    return [p for _, p in sorted(found)]
+
+
+def save_checkpoint(ckpt_dir, ds_name, key, epoch, model, opt, hist, best, args):
+    """Write the new checkpoint FIRST, then delete the older ones — so there is
+    always at least one complete file on disk even if we die mid-write."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    new = os.path.join(ckpt_dir, f"ckpt_{ds_name}_{key}_ep{epoch:06d}.pt")
+    payload = dict(
+        epoch=epoch, model=model.state_dict(), optim=opt.state_dict(),
+        hist=hist, best=best,
+        rng=dict(torch=torch.get_rng_state(),
+                 cuda=(torch.cuda.get_rng_state_all()
+                       if torch.cuda.is_available() else None),
+                 numpy=np.random.get_state()),
+        cfg=dict(views=key, task=args.task, optimizer=args.optimizer,
+                 momentum=args.momentum, lr=args.lr, batch_size=args.batch_size,
+                 epochs=args.epochs, encoding=args.encoding, seed=args.seed))
+    torch.save(payload, new)
+    # partial history alongside it, so results are readable without resuming
+    pd.DataFrame(hist).to_csv(
+        os.path.join(ckpt_dir, f"dd_{ds_name}_{key}_partial.csv"), index=False)
+    for old in _ckpt_list(ckpt_dir, ds_name, key):
+        if os.path.abspath(old) != os.path.abspath(new):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    return new
+
+
+def load_checkpoint(ckpt_dir, ds_name, key, model, opt, args):
+    """Newest readable checkpoint, or None. Falls back to older files if the
+    newest was truncated by a disconnect mid-write."""
+    for path in reversed(_ckpt_list(ckpt_dir, ds_name, key)):
+        try:
+            try:
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:                       # torch < 2.0 has no weights_only
+                ck = torch.load(path, map_location="cpu")
+        except Exception as e:                      # noqa: BLE001 - truncated file
+            print(f"  [ckpt] {os.path.basename(path)} unreadable "
+                  f"({type(e).__name__}) — trying an older one", flush=True)
+            continue
+        cfg = ck.get("cfg", {})
+        for k in ("task", "optimizer", "lr", "batch_size", "encoding"):
+            if k in cfg and cfg[k] != getattr(args, k):
+                print(f"  [ckpt] WARNING: checkpoint {k}={cfg[k]} but this run has "
+                      f"{getattr(args, k)} — resuming anyway", flush=True)
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["optim"])
+        try:
+            torch.set_rng_state(ck["rng"]["torch"])
+            if ck["rng"]["cuda"] is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(ck["rng"]["cuda"])
+            np.random.set_state(ck["rng"]["numpy"])
+        except Exception as e:                      # noqa: BLE001
+            print(f"  [ckpt] could not restore RNG ({type(e).__name__}); "
+                  f"continuing with a fresh shuffle order", flush=True)
+        print(f"  [ckpt] RESUMED from {os.path.basename(path)} "
+              f"(epoch {ck['epoch']})", flush=True)
+        return ck
+    return None
 
 
 def train_double_descent(views, ds, enc, n_classes, args, device, label, csv_path):
@@ -85,8 +163,24 @@ def train_double_descent(views, ds, enc, n_classes, args, device, label, csv_pat
                       torch.from_numpy(ds.y_train).to(device)),
         batch_size=args.batch_size, shuffle=True)
 
-    hist, best = [], {"val_auc": -1.0, "epoch": 0}
-    for epoch in range(1, args.epochs + 1):
+    # ---- resume from Drive if a checkpoint is there ----
+    key = "+".join(views)
+    hist, best, start_epoch = [], {"val_auc": -1.0, "epoch": 0}, 1
+    if args.ckpt_dir and not args.fresh:
+        ck = load_checkpoint(args.ckpt_dir, ds.name, key, model, opt, args)
+        if ck is not None:
+            hist, best = ck["hist"], ck["best"]
+            start_epoch = ck["epoch"] + 1
+            if start_epoch > args.epochs:
+                print(f"  [ckpt] already finished ({ck['epoch']} epochs) — "
+                      f"skipping training, rebuilding outputs", flush=True)
+    if args.ckpt_dir:
+        print(f"  [ckpt] dir={args.ckpt_dir}  every {args.ckpt_every} epochs "
+              f"(only the newest file is kept)", flush=True)
+    if 1 < start_epoch <= args.epochs:
+        print(f"  [ckpt] continuing at epoch {start_epoch}/{args.epochs}", flush=True)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         for xb, tb, yb in loader:
             opt.zero_grad()
@@ -117,10 +211,16 @@ def train_double_descent(views, ds, enc, n_classes, args, device, label, csv_pat
                   f"test_loss={te['loss']:.4f} | "
                   f"train_auc={tr['auc']:.4f} val_auc={va['auc']:.4f} "
                   f"test_auc={te['auc']:.4f}", flush=True)
-        if epoch % args.flush_every == 0:              # crash insurance
+        if epoch % args.flush_every == 0:              # crash insurance (local)
             pd.DataFrame(hist).to_csv(csv_path, index=False)
+        if args.ckpt_dir and epoch % args.ckpt_every == 0:
+            save_checkpoint(args.ckpt_dir, ds.name, key, epoch, model, opt,
+                            hist, best, args)
 
     pd.DataFrame(hist).to_csv(csv_path, index=False)
+    if args.ckpt_dir and hist:                        # final checkpoint
+        save_checkpoint(args.ckpt_dir, ds.name, key, hist[-1]["epoch"], model,
+                        opt, hist, best, args)
     last = hist[-1]
     print(f"  -> FINAL epoch {last['epoch']}: test_auc={last['test_auc']:.4f}  "
           f"train_loss={last['train_loss']:.5f}\n"
@@ -265,6 +365,14 @@ def main():
                     help="write the CSV every N epochs so a crash keeps the history")
     ap.add_argument("--linear-x", action="store_true",
                     help="plot epochs on a linear axis (default is log)")
+    # ---- checkpoint / resume (point this at Google Drive on Colab) ----
+    ap.add_argument("--ckpt-dir", default="",
+                    help="save a resumable checkpoint here (e.g. a mounted "
+                         "Google Drive folder). Empty = no checkpointing")
+    ap.add_argument("--ckpt-every", type=int, default=10,
+                    help="checkpoint every N epochs; only the newest is kept")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore existing checkpoints and start from epoch 1")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--out", default="results/double_descent")
     args = ap.parse_args()
