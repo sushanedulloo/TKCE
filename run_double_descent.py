@@ -182,13 +182,26 @@ def train_double_descent(views, ds, enc, n_classes, args, device, label, csv_pat
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        for xb, tb, yb in loader:
+        # snapshot the weights so we can measure how far this epoch actually moved them
+        theta0 = torch.cat([p.detach().reshape(-1) for p in model.parameters()]).clone()
+        gnorm = float("nan")
+        for i, (xb, tb, yb) in enumerate(loader):
             opt.zero_grad()
             loss = F.cross_entropy(model(xb, tb), yb)
             if args.l1 > 0:
                 loss = loss + args.l1 * sum(p.abs().sum()
                                             for p in model.parameters() if p.ndim >= 2)
-            loss.backward(); opt.step()
+            loss.backward()
+            if i == 0:      # cheap probe: one gradient-norm measurement per epoch
+                gnorm = torch.sqrt(sum((p.grad ** 2).sum()
+                                       for p in model.parameters()
+                                       if p.grad is not None)).item()
+            opt.step()
+        with torch.no_grad():
+            theta1 = torch.cat([p.detach().reshape(-1) for p in model.parameters()])
+            wnorm = theta1.norm().item()
+            pdelta = (theta1 - theta0).norm().item()
+        del theta0, theta1
 
         if epoch % args.eval_every and epoch != 1 and epoch != args.epochs:
             continue                                   # skip eval on this epoch
@@ -200,7 +213,8 @@ def train_double_descent(views, ds, enc, n_classes, args, device, label, csv_pat
                          train_loss=tr["loss"], val_loss=va["loss"], test_loss=te["loss"],
                          train_auc=tr["auc"], val_auc=va["auc"], test_auc=te["auc"],
                          train_acc=tr["accuracy"], val_acc=va["accuracy"],
-                         test_acc=te["accuracy"]))
+                         test_acc=te["accuracy"],
+                         grad_norm=gnorm, weight_norm=wnorm, param_delta=pdelta))
         if va["auc"] > best["val_auc"]:
             best = {"val_auc": va["auc"], "epoch": epoch,
                     "test_auc": te["auc"], "test_acc": te["accuracy"]}
@@ -210,7 +224,8 @@ def train_double_descent(views, ds, enc, n_classes, args, device, label, csv_pat
                   f"train_loss={tr['loss']:.4f} val_loss={va['loss']:.4f} "
                   f"test_loss={te['loss']:.4f} | "
                   f"train_auc={tr['auc']:.4f} val_auc={va['auc']:.4f} "
-                  f"test_auc={te['auc']:.4f}", flush=True)
+                  f"test_auc={te['auc']:.4f} | "
+                  f"||g||={gnorm:.2e} ||w||={wnorm:.1f} move={pdelta:.2e}", flush=True)
         if epoch % args.flush_every == 0:              # crash insurance (local)
             pd.DataFrame(hist).to_csv(csv_path, index=False)
         if args.ckpt_dir and epoch % args.ckpt_every == 0:
@@ -291,6 +306,87 @@ def per_model_figure(df, label, ceiling, path, logx=True):
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(path, dpi=140, bbox_inches="tight")
     plt.close(fig)
+
+
+
+def gradient_figure(df, label, path, lr=1e-5, steps_per_epoch=700, logx=True):
+    """Is the learning signal dead? Three panels that answer it directly."""
+    g = df[df.model == label].sort_values("epoch")
+    g = g[g.grad_norm.notna()] if "grad_norm" in g.columns else g
+    if len(g) == 0:
+        print("  [fig] no gradient data recorded — skipping gradient figure")
+        return
+    sm = g.rolling(25, center=True, min_periods=1).mean(numeric_only=True)
+    fig, ax = plt.subplots(1, 3, figsize=(18, 5))
+
+    def setx(a):
+        if logx and g.epoch.min() > 0:
+            a.set_xscale("log")
+        a.set_xlabel("epoch"); a.grid(alpha=.3)
+
+    a = ax[0]
+    a.plot(g.epoch, g.grad_norm, color="#cf3a4e", lw=.7, alpha=.35)
+    a.plot(sm.epoch, sm.grad_norm, color="#cf3a4e", lw=2)
+    a.set_yscale("log"); setx(a)
+    a.set_ylabel("gradient norm  ||g||  (log)")
+    a.set_title("Is the learning signal dying?\n(flat = converged, falling = still shrinking)",
+                fontweight="bold")
+
+    a = ax[1]
+    a.plot(sm.epoch, sm.weight_norm, color="#3f5bd9", lw=2)
+    setx(a); a.set_ylabel("weight norm  ||theta||")
+    a.set_title("Are the weights still growing?\n(growth = rising confidence = rising loss)",
+                fontweight="bold")
+
+    a = ax[2]
+    a.plot(g.epoch, g.param_delta, color="#1f8a54", lw=.7, alpha=.35)
+    a.plot(sm.epoch, sm.param_delta, color="#1f8a54", lw=2)
+    a.set_yscale("log"); setx(a)
+    a.set_ylabel("weight movement in one epoch (log)")
+    a.set_title("How far did the model actually move?\n(this is 'did anything change')",
+                fontweight="bold")
+
+    last = g.iloc[-1]
+    fig.suptitle(f"Gradient health — {label}   "
+                 f"(at epoch {int(last.epoch)}: ||g||={last.grad_norm:.2e}, "
+                 f"||w||={last.weight_norm:.1f}, movement/epoch={last.param_delta:.2e} "
+                 f"= {last.param_delta/last.weight_norm*100:.4f}% of the weights)",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def gradient_verdict(df, label, lr, steps_per_epoch, future_epochs=11000):
+    """Print the professor's answer: can more epochs still change anything?"""
+    g = df[df.model == label].sort_values("epoch")
+    if "grad_norm" not in g.columns or g.grad_norm.isna().all():
+        print("  (no gradient data recorded in this run)")
+        return
+    g = g[g.grad_norm.notna()]
+    last = g.iloc[-1]
+    recent = g.tail(200)
+    print("\n" + "=" * 70)
+    print("GRADIENT HEALTH — can more epochs still change the model?")
+    print("=" * 70)
+    print(f"  at epoch {int(last.epoch)}:")
+    print(f"    gradient norm ||g||            : {last.grad_norm:.3e}")
+    print(f"    weight norm   ||theta||        : {last.weight_norm:.3f}")
+    print(f"    weight movement in one epoch   : {last.param_delta:.3e} "
+          f"({last.param_delta/last.weight_norm*100:.4f}% of the weights)")
+    first = g.iloc[0]
+    print(f"  since epoch {int(first.epoch)}: ||g|| {first.grad_norm:.2e} -> "
+          f"{last.grad_norm:.2e}  ({last.grad_norm/max(first.grad_norm,1e-30):.3f}x)")
+    proj = recent.param_delta.mean() * future_epochs
+    print(f"\n  recent average movement per epoch : {recent.param_delta.mean():.3e}")
+    print(f"  projected over {future_epochs} more epochs (upper bound, no cancellation):")
+    print(f"    {proj:.3f}  =  {proj/last.weight_norm*100:.2f}% of the current weight norm")
+    if proj / last.weight_norm < 0.01:
+        print("\n  VERDICT: gradient is effectively DEAD — more epochs will not change the model.")
+    elif proj / last.weight_norm < 0.10:
+        print("\n  VERDICT: gradient is very weak — expect only small changes.")
+    else:
+        print("\n  VERDICT: gradient is still meaningful — more training can still move the model.")
 
 
 def compare_figure(df, ceiling, path, logx=True):
@@ -419,9 +515,15 @@ def main():
         csv_path = os.path.join(args.out, f"dd_{ds.name}_{key.replace('+','-')}.csv")
         hist, summ = train_double_descent(v, ds, enc, C, args, device, label, csv_path)
         all_hist.extend(hist); summaries.append(summ)
-        per_model_figure(pd.DataFrame(hist), label, tree_ceiling,
+        hdf = pd.DataFrame(hist)
+        per_model_figure(hdf, label, tree_ceiling,
                          os.path.join(args.out, f"dd_{ds.name}_{key.replace('+','-')}.png"),
                          logx=not args.linear_x)
+        gradient_figure(hdf, label,
+                        os.path.join(args.out, f"dd_{ds.name}_{key.replace('+','-')}_grad.png"),
+                        lr=args.lr, logx=not args.linear_x)
+        gradient_verdict(hdf, label, args.lr,
+                         int(np.ceil(len(ds.y_train) / args.batch_size)))
 
     df = pd.DataFrame(all_hist)
     df.to_csv(os.path.join(args.out, f"dd_{ds.name}_epochs.csv"), index=False)
