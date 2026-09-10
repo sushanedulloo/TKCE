@@ -75,6 +75,13 @@ def split_direction_encoding(rf, X, tau=0.0):
                Soft bits carry "how close to the boundary" information and are
                far less fingerprint-like than hard bits (anti-memorization).
     """
+    return encode_margins(split_margins(rf, X), tau)
+
+
+def split_margins(rf, X):
+    """margin = threshold - x_feat for every internal split node (>0 = goes left).
+    The margin is the raw material for both hard and soft bits, and for the
+    train-time Gaussian-noise augmentation (--enc-noise)."""
     X = np.ascontiguousarray(X)
     cols = []
     for est in rf.estimators_:
@@ -82,13 +89,14 @@ def split_direction_encoding(rf, X, tau=0.0):
         internal = np.where(t.feature >= 0)[0]          # split nodes only
         feats = t.feature[internal]
         thr = t.threshold[internal].astype(np.float32)
-        margin = thr - X[:, feats]                      # >0 means "goes left"
-        if tau > 0:
-            bits = 1.0 / (1.0 + np.exp(-margin / tau))
-        else:
-            bits = (margin >= 0)
-        cols.append(bits.astype(np.float32))
+        cols.append((thr - X[:, feats]).astype(np.float32))
     return np.concatenate(cols, axis=1) if cols else np.zeros((len(X), 0), np.float32)
+
+
+def encode_margins(M, tau=0.0):
+    if tau > 0:
+        return (1.0 / (1.0 + np.exp(-M / tau))).astype(np.float32)
+    return (M >= 0).astype(np.float32)
 
 
 def oob_honest_encoding(rf, enc_train, n_train):
@@ -105,6 +113,13 @@ def oob_honest_encoding(rf, enc_train, n_train):
     match the all-trees encoding used for val/test. Costs nothing: bootstrap
     masks are a free by-product of the RF.
     """
+    ms, mean_oob = oob_mask_matrix(rf, n_train)
+    return enc_train * ms, mean_oob
+
+
+def oob_mask_matrix(rf, n_train):
+    """The (n_train, n_bits) multiplier that implements OOB honesty: zero for
+    in-bag trees' bits, T/|OOB| (inverted-dropout rescale) for kept ones."""
     T = len(rf.estimators_)
     inbag = np.zeros((n_train, T), dtype=bool)
     for t, samp in enumerate(rf.estimators_samples_):
@@ -114,7 +129,7 @@ def oob_honest_encoding(rf, enc_train, n_train):
     counts = [int((est.tree_.feature >= 0).sum()) for est in rf.estimators_]
     colmask = np.repeat(oob, counts, axis=1).astype(np.float32)
     scale = (T / n_oob).astype(np.float32)[:, None]
-    return enc_train * colmask * scale, float(n_oob.mean())
+    return colmask * scale, float(n_oob.mean())
 
 
 # --------------------------------------------------------------------------- #
@@ -179,28 +194,54 @@ def evaluate(model, X, T, y, device, bs=8192, return_proba=False):
     return (m, proba) if return_proba else m
 
 
-def train_one(views, ds, enc, n_classes, args, device, label, member=0):
+def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=None):
     seed = args.seed + 1000 * member
     torch.manual_seed(seed); np.random.seed(seed)
     model = FusionModel(ds.n_features, enc["train"].shape[1], n_classes,
                         views, args).to(device)
     n_par = sum(p.numel() for p in model.parameters())
+    use_noise = noise is not None and args.enc_noise > 0 and "tree" in views
     print(f"\n[{label}]{f' member {member+1}/{args.ensemble}' if args.ensemble > 1 else ''} "
-          f"views={views}  concat_dim={model.cat_dim}  params={n_par/1e6:.2f}M",
+          f"views={views}  concat_dim={model.cat_dim}  params={n_par/1e6:.2f}M"
+          f"{f'  enc-noise sigma={args.enc_noise:g} (fresh each batch)' if use_noise else ''}",
           flush=True)
 
-    loader = DataLoader(
-        TensorDataset(torch.from_numpy(ds.X_train).to(device),
-                      torch.from_numpy(enc["train"]).to(device),
-                      torch.from_numpy(ds.y_train).to(device)),
-        batch_size=args.batch_size, shuffle=True)
+    if use_noise:
+        # loader carries MARGINS; noisy soft bits are made fresh every batch:
+        #   bits = sigmoid((margin + sigma*eps)/tau)   [* OOB mask if honest mode]
+        # eval always uses the clean encoding in `enc` — noise is train-only.
+        ms = noise.get("maskscale")
+        tensors = [torch.from_numpy(ds.X_train).to(device),
+                   torch.from_numpy(noise["margins"]).to(device)]
+        if ms is not None:
+            tensors.append(torch.from_numpy(ms).to(device))
+        tensors.append(torch.from_numpy(ds.y_train).to(device))
+        loader = DataLoader(TensorDataset(*tensors),
+                            batch_size=args.batch_size, shuffle=True)
+    else:
+        loader = DataLoader(
+            TensorDataset(torch.from_numpy(ds.X_train).to(device),
+                          torch.from_numpy(enc["train"]).to(device),
+                          torch.from_numpy(ds.y_train).to(device)),
+            batch_size=args.batch_size, shuffle=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
 
     best_auc, best_state, best_ep, hist = -1.0, None, 0, []
     for epoch in range(1, args.epochs + 1):
         model.train()
-        for xb, tb, yb in loader:
+        for batch in loader:
+            if use_noise:
+                if len(batch) == 4:
+                    xb, mb, msb, yb = batch
+                else:
+                    (xb, mb, yb), msb = batch, None
+                tb = torch.sigmoid(
+                    (mb + args.enc_noise * torch.randn_like(mb)) / args.tau)
+                if msb is not None:
+                    tb = tb * msb
+            else:
+                xb, tb, yb = batch
             opt.zero_grad()
             loss = F.cross_entropy(model(xb, tb), yb)
             if args.l1 > 0:                                   # L1 on weight matrices
@@ -232,14 +273,14 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0):
     return res, hist, te_proba
 
 
-def run_config(views, ds, enc, n_classes, args, device, label):
+def run_config(views, ds, enc, n_classes, args, device, label, noise=None):
     """Train `--ensemble` members (different seeds) and average their test
     probabilities — a plain deep ensemble, the best-evidenced cheap
     regularizer for tabular MLP-family models (cf. TabM)."""
     members, hists, probs = [], [], []
     for m in range(args.ensemble):
         res, hist, p = train_one(views, ds, enc, n_classes, args, device,
-                                 label, member=m)
+                                 label, member=m, noise=noise)
         members.append(res); hists.extend(hist); probs.append(p)
     if args.ensemble == 1:
         return members[0], hists
@@ -274,6 +315,11 @@ def main():
     ap.add_argument("--tau", type=float, default=0.0,
                     help="soft-encoding temperature; 0 = hard bits, try 0.1-1.0 "
                          "(features are standardized)")
+    ap.add_argument("--enc-noise", type=float, default=0.0,
+                    help="train-time Gaussian noise on the split MARGINS, squashed "
+                         "by the sigmoid: bits = sigmoid((margin + sigma*eps)/tau). "
+                         "Fresh noise every batch; eval uses the clean encoding. "
+                         "Requires --tau > 0. Try 0.1-0.4 (features are standardized)")
     ap.add_argument("--encoding", default="infold", choices=["infold", "oob"],
                     help="infold = naive (forest saw the rows it encodes; leaks "
                          "labels into train bits). oob = OOB-honest: train rows "
@@ -334,26 +380,38 @@ def main():
           flush=True)
     print(f"[reg] lr={args.lr:g} batch={args.batch_size} dropout={args.dropout} "
           f"weight_decay={args.weight_decay:g} l1={args.l1:g} "
-          f"encoding={args.encoding} tau={args.tau:g} ensemble={args.ensemble}",
+          f"encoding={args.encoding} tau={args.tau:g} enc_noise={args.enc_noise:g} "
+          f"ensemble={args.ensemble}",
           flush=True)
 
     # -------- view 2: RF split-direction encoding --------
     print(f"[view2] fitting encoding RF ({args.rf_trees} trees, depth {args.rf_depth}) ...",
           flush=True)
+    if args.enc_noise > 0 and args.tau <= 0:
+        raise SystemExit("--enc-noise needs --tau > 0 (the sigmoid that squashes "
+                         "the noisy margins back into (0,1)); try --tau 0.1")
     rf = fit_encoder_rf(ds.X_train, ds.y_train, args)
-    enc = {"train": split_direction_encoding(rf, ds.X_train, args.tau),
+    M_train = split_margins(rf, ds.X_train)
+    enc = {"train": encode_margins(M_train, args.tau),
            "val":   split_direction_encoding(rf, ds.X_val, args.tau),
            "test":  split_direction_encoding(rf, ds.X_test, args.tau)}
     E = enc["train"].shape[1]
     print(f"[view2] tree-encoding width = {E} split bits "
           f"({'hard' if args.tau == 0 else f'soft tau={args.tau:g}'}, "
           f"~{E * enc['train'].shape[0] * 4 / 1e6:.0f} MB train)", flush=True)
+    noise_pack = None
+    maskscale = None
     if args.encoding == "oob":
-        enc["train"], mean_oob = oob_honest_encoding(rf, enc["train"],
-                                                     len(ds.y_train))
+        maskscale, mean_oob = oob_mask_matrix(rf, len(ds.y_train))
+        enc["train"] = enc["train"] * maskscale
         print(f"[view2] OOB-honest training encoding: each train row keeps bits "
               f"from {mean_oob:.1f}/{args.rf_trees} trees on average "
               f"(val/test keep all trees)", flush=True)
+    if args.enc_noise > 0:
+        noise_pack = {"margins": M_train, "maskscale": maskscale}
+        print(f"[view2] train-time margin noise: sigma={args.enc_noise:g}, "
+              f"resampled every batch; evaluation uses the clean encoding",
+              flush=True)
 
     # -------- tree ceiling (reference) --------
     print("[ceiling] fitting tree baselines ...", flush=True)
@@ -376,7 +434,7 @@ def main():
     results, hists = [], []
     for v in run_views:
         lab = labels.get("+".join(v), "+".join(v))
-        res, h = run_config(v, ds, enc, C, args, device, lab)
+        res, h = run_config(v, ds, enc, C, args, device, lab, noise=noise_pack)
         results.append(res); hists.extend(h)
     hdf = pd.DataFrame(hists)
     hdf.to_csv(os.path.join(args.out, f"fusion_{ds.name}_epochs.csv"), index=False)
@@ -402,7 +460,8 @@ def main():
     summary = dict(dataset=ds.name, task=args.task, seed=args.seed, fusion=args.fusion,
                    lr=args.lr, batch_size=args.batch_size, dropout=args.dropout,
                    weight_decay=args.weight_decay, l1=args.l1,
-                   encoding=args.encoding, tau=args.tau, ensemble=args.ensemble,
+                   encoding=args.encoding, tau=args.tau, enc_noise=args.enc_noise,
+                   ensemble=args.ensemble,
                    drop_cols=drop_cols or [], group_by=group_col,
                    split=ds.meta["split"],
                    tree_ceiling=tree_ceiling, ceiling=ceil, tree_encoding_width=E,
