@@ -99,6 +99,39 @@ def encode_margins(M, tau=0.0):
     return (M >= 0).astype(np.float32)
 
 
+def node_depths_and_samples(rf):
+    """Depth + training-sample count for every internal split node, in the SAME
+    column order that split_margins uses. Deep nodes are fit on few samples —
+    they are the rote-memorization part of the encoding."""
+    depths, samples = [], []
+    for est in rf.estimators_:
+        t = est.tree_
+        d = np.zeros(t.node_count, dtype=np.int32)
+        stack = [(0, 0)]
+        while stack:
+            i, dep = stack.pop()
+            d[i] = dep
+            if t.children_left[i] != -1:
+                stack.append((t.children_left[i], dep + 1))
+                stack.append((t.children_right[i], dep + 1))
+        internal = np.where(t.feature >= 0)[0]
+        depths.append(d[internal])
+        samples.append(t.n_node_samples[internal].astype(np.int64))
+    return np.concatenate(depths), np.concatenate(samples)
+
+
+def deepest_bits_mask(rf, frac):
+    """Boolean mask over the encoding columns selecting the deepest `frac` of
+    split nodes (ties broken by fewest training samples = most memorized)."""
+    depths, samples = node_depths_and_samples(rf)
+    n = len(depths)
+    k = max(1, int(round(frac * n)))
+    order = np.lexsort((samples, -depths))    # deepest first, then fewest-sample
+    mask = np.zeros(n, dtype=bool)
+    mask[order[:k]] = True
+    return mask, depths, samples
+
+
 def oob_honest_encoding(rf, enc_train, n_train):
     """OOB-honest ("out-of-bag dropout") training encoding.
 
@@ -200,19 +233,24 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
     model = FusionModel(ds.n_features, enc["train"].shape[1], n_classes,
                         views, args).to(device)
     n_par = sum(p.numel() for p in model.parameters())
-    use_noise = noise is not None and args.enc_noise > 0 and "tree" in views
+    use_noise = noise is not None and "tree" in views
     print(f"\n[{label}]{f' member {member+1}/{args.ensemble}' if args.ensemble > 1 else ''} "
           f"views={views}  concat_dim={model.cat_dim}  params={n_par/1e6:.2f}M"
-          f"{f'  enc-noise sigma={args.enc_noise:g} (fresh each batch)' if use_noise else ''}",
+          f"{('  enc-noise sigma=%g (fresh each batch)' % args.enc_noise) if use_noise and noise['kind'] == 'margin_noise' else ''}"
+          f"{('  deep-flip p=%g on %d bits (fresh each batch)' % (args.deep_flip_p, int(noise['deep_mask'].sum()))) if use_noise and noise['kind'] == 'deep_flip' else ''}",
           flush=True)
 
+    dmask_t = None
     if use_noise:
-        # loader carries MARGINS; noisy soft bits are made fresh every batch:
-        #   bits = sigmoid((margin + sigma*eps)/tau)   [* OOB mask if honest mode]
-        # eval always uses the clean encoding in `enc` — noise is train-only.
+        # loader carries the RAW material (margins or hard bits); the noisy /
+        # flipped bits are made fresh every batch, then the OOB mask is applied.
+        # eval always uses the clean encoding in `enc` — augmentation is train-only.
         ms = noise.get("maskscale")
+        raw = noise["margins"] if noise["kind"] == "margin_noise" else noise["bits"]
+        if noise["kind"] == "deep_flip":
+            dmask_t = torch.from_numpy(noise["deep_mask"]).to(device).unsqueeze(0)
         tensors = [torch.from_numpy(ds.X_train).to(device),
-                   torch.from_numpy(noise["margins"]).to(device)]
+                   torch.from_numpy(raw).to(device)]
         if ms is not None:
             tensors.append(torch.from_numpy(ms).to(device))
         tensors.append(torch.from_numpy(ds.y_train).to(device))
@@ -236,8 +274,12 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
                     xb, mb, msb, yb = batch
                 else:
                     (xb, mb, yb), msb = batch, None
-                tb = torch.sigmoid(
-                    (mb + args.enc_noise * torch.randn_like(mb)) / args.tau)
+                if noise["kind"] == "margin_noise":
+                    tb = torch.sigmoid(
+                        (mb + args.enc_noise * torch.randn_like(mb)) / args.tau)
+                else:                                  # deep_flip: mb = hard bits
+                    flips = (torch.rand_like(mb) < args.deep_flip_p) & dmask_t
+                    tb = torch.where(flips, 1.0 - mb, mb)
                 if msb is not None:
                     tb = tb * msb
             else:
@@ -315,6 +357,17 @@ def main():
     ap.add_argument("--tau", type=float, default=0.0,
                     help="soft-encoding temperature; 0 = hard bits, try 0.1-1.0 "
                          "(features are standardized)")
+    ap.add_argument("--deep-frac", type=float, default=0.1,
+                    help="fraction of DEEPEST split bits targeted by --deep-flip-p "
+                         "/ --deep-delete (professor: 'the last 10%%')")
+    ap.add_argument("--deep-flip-p", type=float, default=0.0,
+                    help="train-time flip probability (0<->1) for the deepest bits, "
+                         "fresh each batch; bits stay binary; eval uses clean bits. "
+                         "p=0.5 = replace those bits with pure coin flips")
+    ap.add_argument("--deep-delete", action="store_true",
+                    help="zero out the deepest bits entirely (train AND eval) — the "
+                         "diagnostic arm: if deep bits are pure memorization, "
+                         "deleting them should barely hurt test")
     ap.add_argument("--enc-noise", type=float, default=0.0,
                     help="train-time Gaussian noise on the split MARGINS, squashed "
                          "by the sigmoid: bits = sigmoid((margin + sigma*eps)/tau). "
@@ -390,6 +443,13 @@ def main():
     if args.enc_noise > 0 and args.tau <= 0:
         raise SystemExit("--enc-noise needs --tau > 0 (the sigmoid that squashes "
                          "the noisy margins back into (0,1)); try --tau 0.1")
+    if args.deep_flip_p > 0 and args.deep_delete:
+        raise SystemExit("pick ONE of --deep-flip-p / --deep-delete")
+    if args.deep_flip_p > 0 and args.enc_noise > 0:
+        raise SystemExit("pick ONE of --deep-flip-p / --enc-noise")
+    if args.deep_flip_p > 0 and args.tau != 0:
+        raise SystemExit("--deep-flip-p works on HARD bits; drop --tau "
+                         "(flipping soft bits would re-introduce the softness confound)")
     rf = fit_encoder_rf(ds.X_train, ds.y_train, args)
     M_train = split_margins(rf, ds.X_train)
     enc = {"train": encode_margins(M_train, args.tau),
@@ -408,10 +468,32 @@ def main():
               f"from {mean_oob:.1f}/{args.rf_trees} trees on average "
               f"(val/test keep all trees)", flush=True)
     if args.enc_noise > 0:
-        noise_pack = {"margins": M_train, "maskscale": maskscale}
+        noise_pack = {"kind": "margin_noise", "margins": M_train, "maskscale": maskscale}
         print(f"[view2] train-time margin noise: sigma={args.enc_noise:g}, "
               f"resampled every batch; evaluation uses the clean encoding",
               flush=True)
+    if args.deep_flip_p > 0 or args.deep_delete:
+        dmask, depths, samp = deepest_bits_mask(rf, args.deep_frac)
+        tgt, rest = samp[dmask], samp[~dmask]
+        print(f"[deep] targeting the deepest {args.deep_frac:.0%} of bits: "
+              f"{int(dmask.sum())}/{len(dmask)} nodes, depths "
+              f"{int(depths[dmask].min())}-{int(depths[dmask].max())} "
+              f"(vs {int(depths.min())}-{int(depths.max())} overall)", flush=True)
+        print(f"[deep] median training samples per targeted node: {int(np.median(tgt))} "
+              f"vs {int(np.median(rest))} for the rest "
+              f"<- few samples = rote memorization", flush=True)
+        if args.deep_delete:
+            for k in enc:
+                enc[k][:, dmask] = 0.0
+            print(f"[deep] DELETE mode: those bits are zeroed everywhere "
+                  f"(train + val + test)", flush=True)
+        else:
+            noise_pack = {"kind": "deep_flip",
+                          "bits": encode_margins(M_train, 0.0),
+                          "maskscale": maskscale, "deep_mask": dmask}
+            print(f"[deep] FLIP mode: each targeted bit flips 0<->1 with "
+                  f"p={args.deep_flip_p:g}, fresh every batch (train only; "
+                  f"p=0.5 = pure coin flips)", flush=True)
 
     # -------- tree ceiling (reference) --------
     print("[ceiling] fitting tree baselines ...", flush=True)
@@ -461,6 +543,8 @@ def main():
                    lr=args.lr, batch_size=args.batch_size, dropout=args.dropout,
                    weight_decay=args.weight_decay, l1=args.l1,
                    encoding=args.encoding, tau=args.tau, enc_noise=args.enc_noise,
+                   deep_frac=args.deep_frac, deep_flip_p=args.deep_flip_p,
+                   deep_delete=bool(args.deep_delete),
                    ensemble=args.ensemble,
                    drop_cols=drop_cols or [], group_by=group_col,
                    split=ds.meta["split"],
