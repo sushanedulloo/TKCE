@@ -330,7 +330,9 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
     res = dict(model=label, views="+".join(views), member=member,
                test_auc=te["auc"], test_acc=te["accuracy"],
                best_val_auc=best_auc, best_epoch=best_ep,
-               concat_dim=model.cat_dim, params_M=round(n_par / 1e6, 2))
+               concat_dim=model.cat_dim, params_M=round(n_par / 1e6, 2),
+               params=int(n_par), d=args.d, d_hidden=args.d_hidden,
+               n_blocks=args.n_blocks)
     return res, hist, te_proba
 
 
@@ -351,7 +353,9 @@ def run_config(views, ds, enc, n_classes, args, device, label, noise=None):
                best_val_auc=float(np.mean([r["best_val_auc"] for r in members])),
                best_epoch=int(np.mean([r["best_epoch"] for r in members])),
                concat_dim=members[0]["concat_dim"],
-               params_M=members[0]["params_M"], ensemble=args.ensemble,
+               params_M=members[0]["params_M"], params=members[0]["params"],
+               d=args.d, d_hidden=args.d_hidden, n_blocks=args.n_blocks,
+               ensemble=args.ensemble,
                member_test_aucs=[round(r["test_auc"], 4) for r in members])
     member_str = ", ".join(f"{r['test_auc']:.4f}" for r in members)
     print(f"  => {label:22s} ENSEMBLE({args.ensemble}) TEST auc={em['auc']:.4f} "
