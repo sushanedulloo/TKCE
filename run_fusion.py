@@ -492,12 +492,12 @@ def main():
     ap.add_argument("--log-batches", action="store_true",
                     help="print and record metrics for every mini-batch, not just "
                          "once per epoch (written to fusion_<ds>_batches.csv)")
-    ap.add_argument("--log-batch-every", type=int, default=10,
-                    help="PRINT cadence within an epoch (1 = every batch). The CSV "
-                         "always records every batch of the logged epochs")
-    ap.add_argument("--log-batch-epochs", type=int, default=20,
-                    help="log batches only for the first K epochs (0 = all epochs). "
-                         "Guards against 400 epochs x 88 batches of output")
+    ap.add_argument("--log-batch-every", type=int, default=1,
+                    help="PRINT cadence within an epoch; default 1 = EVERY batch. "
+                         "Raise it (e.g. 10) if the output volume is a problem")
+    ap.add_argument("--log-batch-epochs", type=int, default=0,
+                    help="log batches for the first K epochs only; default 0 = "
+                         "EVERY epoch (400 epochs x 88 batches is ~35k lines per model)")
     ap.add_argument("--out", default="results/fusion")
     args = ap.parse_args()
 
