@@ -322,13 +322,18 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
             opt.zero_grad()
             out = model(xb, tb)               # kept: batch metrics come for free
             loss = F.cross_entropy(out, yb)
+            ce_t = loss.detach() if log_b else None    # data loss, before L1
             if args.l1 > 0:                                   # L1 on weight matrices
                 loss = loss + args.l1 * sum(p.abs().sum()
                                             for p in model.parameters() if p.ndim >= 2)
             loss.backward(); opt.step()
             step += 1; bidx += 1
             if log_b:
-                bl = float(loss.detach())
+                # NB every number below describes the model state that PRODUCED
+                # the gradient, i.e. before this batch's opt.step() — the usual
+                # convention for training curves.
+                bl = float(ce_t)                  # comparable to epoch train_loss
+                btot = float(loss.detach())       # == bl unless --l1 > 0
                 run_sum += bl
                 with torch.no_grad():
                     bacc = float((out.argmax(1) == yb).float().mean())
@@ -339,6 +344,7 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
                         bauc = float(roc_auc_score(yv, pv))
                 bhist.append(dict(model=label, member=member, epoch=epoch,
                                   batch=bidx, step=step, batch_loss=round(bl, 6),
+                                  batch_total_loss=round(btot, 6),
                                   run_avg_loss=round(run_sum / bidx, 6),
                                   batch_acc=round(bacc, 4),
                                   batch_auc=None if bauc != bauc else round(bauc, 4)))
