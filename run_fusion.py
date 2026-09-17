@@ -247,6 +247,12 @@ def evaluate(model, X, T, y, device, bs=8192, return_proba=False):
     return (m, proba) if return_proba else m
 
 
+def batch_csv_path(args, ds):
+    """Where the per-batch CSV lives — <out>/ by default, or --batch-csv
+    (point it at a mounted Google Drive folder to keep the record durable)."""
+    return args.batch_csv or os.path.join(args.out, f"fusion_{ds.name}_batches.csv")
+
+
 def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=None):
     seed = args.seed + 1000 * member
     torch.manual_seed(seed); np.random.seed(seed)
@@ -292,7 +298,8 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
         model.train()
         log_b = args.log_batches and (args.log_batch_epochs == 0
                                       or epoch <= args.log_batch_epochs)
-        if log_b:
+        print_b = log_b and args.log_batch_every > 0
+        if print_b:
             print(f"    -- epoch {epoch}: {n_batches} batches of {args.batch_size} "
                   f"(printing every {args.log_batch_every}) --", flush=True)
         run_sum, bidx = 0.0, 0
@@ -335,7 +342,8 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
                                   run_avg_loss=round(run_sum / bidx, 6),
                                   batch_acc=round(bacc, 4),
                                   batch_auc=None if bauc != bauc else round(bauc, 4)))
-                if bidx % max(1, args.log_batch_every) == 0 or bidx == n_batches:
+                if print_b and (bidx % max(1, args.log_batch_every) == 0
+                                or bidx == n_batches):
                     aucs = "  auc=  n/a" if bauc != bauc else f"  auc={bauc:.4f}"
                     print(f"      e{epoch:<4d} b{bidx:4d}/{n_batches}  "
                           f"loss={bl:.4f}  avg={run_sum / bidx:.4f}  "
@@ -359,7 +367,8 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
     print(f"  -> {label:22s} TEST auc={te['auc']:.4f} acc={te['accuracy']:.4f} "
           f"(best val {best_auc:.4f} @ epoch {best_ep})", flush=True)
     if bhist:
-        bpath = os.path.join(args.out, f"fusion_{ds.name}_batches.csv")
+        bpath = batch_csv_path(args, ds)
+        os.makedirs(os.path.dirname(os.path.abspath(bpath)), exist_ok=True)
         bdf = pd.DataFrame(bhist)
         bdf.to_csv(bpath, mode="a", header=not os.path.exists(bpath), index=False)
         print(f"     [batches] +{len(bdf)} rows -> {bpath}", flush=True)
@@ -490,14 +499,17 @@ def main():
     ap.add_argument("--device", default="auto")
     # per-batch logging
     ap.add_argument("--log-batches", action="store_true",
-                    help="print and record metrics for every mini-batch, not just "
-                         "once per epoch (written to fusion_<ds>_batches.csv)")
-    ap.add_argument("--log-batch-every", type=int, default=1,
-                    help="PRINT cadence within an epoch; default 1 = EVERY batch. "
-                         "Raise it (e.g. 10) if the output volume is a problem")
+                    help="RECORD every mini-batch (loss, running-mean loss, accuracy, "
+                         "AUC) to the batch CSV. The console keeps showing only the "
+                         "normal per-epoch lines unless --log-batch-every > 0")
+    ap.add_argument("--log-batch-every", type=int, default=0,
+                    help="also PRINT every Nth batch; default 0 = print nothing extra, "
+                         "so the console stays readable while the CSV holds everything")
     ap.add_argument("--log-batch-epochs", type=int, default=0,
-                    help="log batches for the first K epochs only; default 0 = "
-                         "EVERY epoch (400 epochs x 88 batches is ~35k lines per model)")
+                    help="record batches for the first K epochs only; default 0 = every epoch")
+    ap.add_argument("--batch-csv", default=None,
+                    help="explicit path for the per-batch CSV (e.g. a Google Drive "
+                         "folder); default <out>/fusion_<dataset>_batches.csv")
     ap.add_argument("--out", default="results/fusion")
     args = ap.parse_args()
 
@@ -633,7 +645,7 @@ def main():
         run_views = [["x"], ["x", "tree", "deep"]]
     labels = {"x": "raw (x only)", "x+tree": "x + tree", "x+deep": "x + deep",
               "x+tree+deep": "FULL (x+tree+deep)"}
-    bpath = os.path.join(args.out, f"fusion_{ds.name}_batches.csv")
+    bpath = batch_csv_path(args, ds)
     if os.path.exists(bpath):
         os.remove(bpath)          # fresh file per run; train_one appends to it
     results, hists = [], []
