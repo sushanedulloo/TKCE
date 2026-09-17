@@ -486,7 +486,10 @@ def main():
     ap.add_argument("--ext-d-hidden", type=int, default=256)
     ap.add_argument("--ext-blocks", type=int, default=3)
     # fusion net + head
-    ap.add_argument("--fusion", default="tabresnet", choices=["tabresnet", "mlp"])
+    ap.add_argument("--fusion", default="tabresnet",
+                    choices=["tabresnet", "mlp", "linear"],
+                    help="trunk on top of the concatenated views; 'linear' is a "
+                         "plain logistic regression (no hidden layer at all)")
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--d-hidden", type=int, default=512)
     ap.add_argument("--n-blocks", type=int, default=4)

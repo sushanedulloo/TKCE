@@ -220,6 +220,11 @@ def head_out_dim(dataset) -> int:
 
 
 def build_head(kind: str, in_dim: int, out_dim: int, cfg: dict) -> nn.Module:
+    if kind == "linear":
+        # Multinomial logistic regression: one weight per input feature, no
+        # hidden layer, no nonlinearity. The strongest possible statement about
+        # how much signal the input itself carries.
+        return nn.Linear(in_dim, out_dim)
     if kind == "mlp":
         return MLPHead(in_dim, out_dim,
                        hidden_dims=tuple(cfg.get("hidden_dims", (256, 128))),
