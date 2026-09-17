@@ -45,6 +45,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 
 from tkce.baselines import fit_tree_baseline
@@ -285,8 +286,16 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
                             weight_decay=args.weight_decay)
 
     best_auc, best_state, best_ep, hist = -1.0, None, 0, []
+    n_batches = len(loader)
+    bhist, step = [], 0
     for epoch in range(1, args.epochs + 1):
         model.train()
+        log_b = args.log_batches and (args.log_batch_epochs == 0
+                                      or epoch <= args.log_batch_epochs)
+        if log_b:
+            print(f"    -- epoch {epoch}: {n_batches} batches of {args.batch_size} "
+                  f"(printing every {args.log_batch_every}) --", flush=True)
+        run_sum, bidx = 0.0, 0
         for batch in loader:
             if use_noise:
                 if len(batch) == 4:
@@ -304,11 +313,33 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
             else:
                 xb, tb, yb = batch
             opt.zero_grad()
-            loss = F.cross_entropy(model(xb, tb), yb)
+            out = model(xb, tb)               # kept: batch metrics come for free
+            loss = F.cross_entropy(out, yb)
             if args.l1 > 0:                                   # L1 on weight matrices
                 loss = loss + args.l1 * sum(p.abs().sum()
                                             for p in model.parameters() if p.ndim >= 2)
             loss.backward(); opt.step()
+            step += 1; bidx += 1
+            if log_b:
+                bl = float(loss.detach())
+                run_sum += bl
+                with torch.no_grad():
+                    bacc = float((out.argmax(1) == yb).float().mean())
+                    bauc = float("nan")
+                    yv = yb.detach().cpu().numpy()
+                    if n_classes == 2 and 0 < yv.sum() < len(yv):
+                        pv = torch.softmax(out.detach(), 1)[:, 1].cpu().numpy()
+                        bauc = float(roc_auc_score(yv, pv))
+                bhist.append(dict(model=label, member=member, epoch=epoch,
+                                  batch=bidx, step=step, batch_loss=round(bl, 6),
+                                  run_avg_loss=round(run_sum / bidx, 6),
+                                  batch_acc=round(bacc, 4),
+                                  batch_auc=None if bauc != bauc else round(bauc, 4)))
+                if bidx % max(1, args.log_batch_every) == 0 or bidx == n_batches:
+                    aucs = "  auc=  n/a" if bauc != bauc else f"  auc={bauc:.4f}"
+                    print(f"      e{epoch:<4d} b{bidx:4d}/{n_batches}  "
+                          f"loss={bl:.4f}  avg={run_sum / bidx:.4f}  "
+                          f"acc={bacc:.4f}{aucs}", flush=True)
         tr = evaluate(model, ds.X_train, enc["train"], ds.y_train, device)
         va = evaluate(model, ds.X_val, enc["val"], ds.y_val, device)
         hist.append(dict(model=label, epoch=epoch,
@@ -327,6 +358,12 @@ def train_one(views, ds, enc, n_classes, args, device, label, member=0, noise=No
                             return_proba=True)
     print(f"  -> {label:22s} TEST auc={te['auc']:.4f} acc={te['accuracy']:.4f} "
           f"(best val {best_auc:.4f} @ epoch {best_ep})", flush=True)
+    if bhist:
+        bpath = os.path.join(args.out, f"fusion_{ds.name}_batches.csv")
+        bdf = pd.DataFrame(bhist)
+        bdf.to_csv(bpath, mode="a", header=not os.path.exists(bpath), index=False)
+        print(f"     [batches] +{len(bdf)} rows -> {bpath}", flush=True)
+
     res = dict(model=label, views="+".join(views), member=member,
                test_auc=te["auc"], test_acc=te["accuracy"],
                best_val_auc=best_auc, best_epoch=best_ep,
@@ -451,6 +488,16 @@ def main():
     ap.add_argument("--ablation", action="store_true",
                     help="also run x+tree and x+deep to isolate each view")
     ap.add_argument("--device", default="auto")
+    # per-batch logging
+    ap.add_argument("--log-batches", action="store_true",
+                    help="print and record metrics for every mini-batch, not just "
+                         "once per epoch (written to fusion_<ds>_batches.csv)")
+    ap.add_argument("--log-batch-every", type=int, default=10,
+                    help="PRINT cadence within an epoch (1 = every batch). The CSV "
+                         "always records every batch of the logged epochs")
+    ap.add_argument("--log-batch-epochs", type=int, default=20,
+                    help="log batches only for the first K epochs (0 = all epochs). "
+                         "Guards against 400 epochs x 88 batches of output")
     ap.add_argument("--out", default="results/fusion")
     args = ap.parse_args()
 
@@ -586,6 +633,9 @@ def main():
         run_views = [["x"], ["x", "tree", "deep"]]
     labels = {"x": "raw (x only)", "x+tree": "x + tree", "x+deep": "x + deep",
               "x+tree+deep": "FULL (x+tree+deep)"}
+    bpath = os.path.join(args.out, f"fusion_{ds.name}_batches.csv")
+    if os.path.exists(bpath):
+        os.remove(bpath)          # fresh file per run; train_one appends to it
     results, hists = [], []
     for v in run_views:
         lab = labels.get("+".join(v), "+".join(v))
