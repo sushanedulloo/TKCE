@@ -34,8 +34,8 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from run_fusion import (fit_encoder_rf, oob_honest_encoding,
-                        split_direction_encoding)
+from run_fusion import (fit_encoder_rf, node_depths_and_samples,
+                        oob_honest_encoding, split_direction_encoding)
 from tkce.baselines import fit_tree_baseline
 from tkce.data import load_task
 
@@ -60,6 +60,16 @@ def main():
     ap.add_argument("--rf-depth", type=int, default=6)
     ap.add_argument("--rf-min-leaf", type=int, default=5)
     ap.add_argument("--encoding", default="oob", choices=["oob", "infold"])
+    ap.add_argument("--views", default="x;tree;x+tree",
+                    help="semicolon-separated inputs to probe, e.g. 'tree' to run "
+                         "only the bits-alone arm (much faster)")
+    ap.add_argument("--keep-layers", type=str, default=None,
+                    help="keep only these tree depths, e.g. '0,1,2'. The columns for "
+                         "every other split are DROPPED, so the reported feature "
+                         "count is what the model actually sees")
+    ap.add_argument("--drop-layers", type=str, default=None,
+                    help="drop these tree depths, e.g. '5' or '4,5' for the last "
+                         "few layers")
     ap.add_argument("--C", type=float, nargs="+",
                     default=[1e-4, 3e-4, 1e-3, 3e-3, 0.01, 0.03, 0.1, 0.3, 1.0],
                     help="inverse regularisation strengths (C = 1/lambda, so SMALL "
@@ -90,6 +100,26 @@ def main():
         print(f"[view2] OOB-honest: each train row keeps bits from "
               f"{mean_oob:.1f}/{args.rf_trees} trees", flush=True)
 
+    # ---- static bit selection (deletion is a plain column drop for a linear model) ----
+    depths, samples = node_depths_and_samples(rf)
+    kept_depths = sorted(set(depths.tolist()))
+    if args.keep_layers and args.drop_layers:
+        raise SystemExit("pass only one of --keep-layers / --drop-layers")
+    sel = None
+    if args.keep_layers:
+        keep = [int(v) for v in args.keep_layers.split(",")]
+        sel, what = np.isin(depths, keep), f"keep only depths {keep}"
+    elif args.drop_layers:
+        drop = [int(v) for v in args.drop_layers.split(",")]
+        sel, what = ~np.isin(depths, drop), f"drop depths {drop}"
+    if sel is not None:
+        kept_depths = sorted(set(depths[sel].tolist()))
+        print(f"[bits] {what}: keeping {int(sel.sum())}/{len(sel)} bits at depths "
+              f"{kept_depths} (median {int(np.median(samples[sel]))} training rows "
+              f"per kept split vs {int(np.median(samples[~sel]))} per dropped one)",
+              flush=True)
+        T = {k: v[:, sel] for k, v in T.items()}
+
     # ---- reference ceiling ----
     print("[ceiling] fitting tree baselines ...", flush=True)
     ceil = {}
@@ -101,7 +131,7 @@ def main():
 
     # ---- the probes ----
     results = []
-    for view in VIEWS:
+    for view in [v.strip() for v in args.views.split(";") if v.strip()]:
         Xtr = build(view, ds.X_train, T["train"])
         Xva = build(view, ds.X_val, T["val"])
         Xte = build(view, ds.X_test, T["test"])
@@ -152,18 +182,24 @@ def main():
         print(f"\n  [!] C landed on the edge of the grid for: {', '.join(edged)}"
               f"  (grid was {min(args.C):g} .. {max(args.C):g})")
     print()
-    lift = by["tree"]["test_auc"] - by["x"]["test_auc"]
-    print(f"  tree bits alone, with NO raw features and NO hidden layer: "
-          f"{by['tree']['test_auc']:.4f}")
-    print(f"  raw features alone, same linear model:                     "
-          f"{by['x']['test_auc']:.4f}")
-    print(f"  the bits are worth {lift:+.4f} AUC to a linear model")
-    print(f"  fraction of the tree ceiling reached by the bits alone:    "
-          f"{by['tree']['test_auc'] / tree_ceiling:.1%}")
+    if "tree" in by:
+        print(f"  tree bits alone, with NO raw features and NO hidden layer: "
+              f"{by['tree']['test_auc']:.4f}")
+        print(f"  fraction of the tree ceiling reached by the bits alone:    "
+              f"{by['tree']['test_auc'] / tree_ceiling:.1%}")
+    if "x" in by:
+        print(f"  raw features alone, same linear model:                     "
+              f"{by['x']['test_auc']:.4f}")
+    if "tree" in by and "x" in by:
+        print(f"  the bits are worth "
+              f"{by['tree']['test_auc'] - by['x']['test_auc']:+.4f} AUC to a "
+              f"linear model")
 
     summary = dict(dataset=ds.name, task=args.task, seed=args.seed,
                    encoding=args.encoding, rf_trees=args.rf_trees,
                    rf_depth=args.rf_depth, tree_encoding_width=int(T["val"].shape[1]),
+                   keep_layers=args.keep_layers, drop_layers=args.drop_layers,
+                   kept_depths=kept_depths, C_grid=list(args.C),
                    ceiling=ceil, tree_ceiling=tree_ceiling, results=results)
     path = os.path.join(args.out, f"linear_probe_{ds.name}.json")
     with open(path, "w") as f:

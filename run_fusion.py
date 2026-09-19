@@ -448,6 +448,10 @@ def main():
                     help="how the targeted bits are chosen: deepest (default), "
                          "shallowest (the reverse arm), or random of the same "
                          "size (the matched control)")
+    ap.add_argument("--keep-layers", type=str, default=None,
+                    help="KEEP only these tree depths and delete every other bit, "
+                         "e.g. '0,1,2' for the three shallowest layers. The positive "
+                         "form of --deep-layers + --deep-delete; implies deletion")
     ap.add_argument("--deep-layers", type=str, default=None,
                     help="target whole depth layers instead of a fraction, e.g. "
                          "'5' (bottom layer), '4,5', '0,1,2'; with --deep-select "
@@ -456,6 +460,13 @@ def main():
                     help="depth-ramped bit flips on ALL bits: p(depth) = P * "
                          "depth/max_depth (roots never flip, bottom layer gets P); "
                          "train-only, fresh each batch, bits stay binary")
+    ap.add_argument("--flip-ramp-rel", action="store_true",
+                    help="scale --flip-ramp against the deepest SURVIVING layer "
+                         "instead of the tree's true max depth, so the full P is "
+                         "reached even when the deepest layers have been deleted. "
+                         "Off by default: a node's flip rate should track its own "
+                         "unreliability, which depends on its true depth, and that "
+                         "keeps a given P comparable across arms")
     ap.add_argument("--flip-uniform", type=float, default=0.0,
                     help="uniform bit flips on ALL bits with probability P — the "
                          "matched-budget control for --flip-ramp")
@@ -553,8 +564,11 @@ def main():
     n_flip = sum([args.deep_flip_p > 0, args.flip_ramp > 0, args.flip_uniform > 0])
     if n_flip > 1:
         raise SystemExit("pick ONE of --deep-flip-p / --flip-ramp / --flip-uniform")
-    if n_flip and args.deep_delete:
-        raise SystemExit("bit flips cannot be combined with --deep-delete")
+    # Deletion and flips deliberately COMPOSE: the advisor's design is "delete the
+    # last few layers, and ramp the flips over the layers that remain".
+    if args.keep_layers and (args.deep_layers or args.deep_frac != 0.1):
+        raise SystemExit("--keep-layers already says which bits to drop; "
+                         "do not also pass --deep-layers / --deep-frac")
     if n_flip and args.enc_noise > 0:
         raise SystemExit("pick ONE of bit flips / --enc-noise")
     if n_flip and args.tau != 0:
@@ -584,57 +598,87 @@ def main():
               flush=True)
     deep_layers = ([int(v) for v in args.deep_layers.split(",")]
                    if args.deep_layers else None)
+    keep_layers = ([int(v) for v in args.keep_layers.split(",")]
+                   if args.keep_layers else None)
     deep_info = {}
-    if args.deep_flip_p > 0 or args.deep_delete:
-        dmask, depths, samp = select_bits(
+    all_depths, all_samples = node_depths_and_samples(rf)
+    max_depth = int(all_depths.max())
+
+    # ---- step 1: which bits are DELETED (zeroed in train, val and test alike) ----
+    del_mask = None
+    if keep_layers is not None:
+        del_mask = ~np.isin(all_depths, keep_layers)
+        what = f"keep only depths {keep_layers}"
+    elif args.deep_delete:
+        del_mask, _, _ = select_bits(
             rf, frac=None if deep_layers else args.deep_frac, layers=deep_layers,
             select=args.deep_select, seed=args.seed)
-        tgt, rest = samp[dmask], samp[~dmask]
-        what = f"layers {deep_layers}" if deep_layers else f"{args.deep_frac:.0%}"
-        print(f"[deep] targeting {args.deep_select} {what}: "
-              f"{int(dmask.sum())}/{len(dmask)} bits ({dmask.mean():.1%}), depths "
-              f"{int(depths[dmask].min())}-{int(depths[dmask].max())} "
-              f"(vs {int(depths.min())}-{int(depths.max())} overall)", flush=True)
-        print(f"[deep] median training samples per targeted node: {int(np.median(tgt))} "
-              f"vs {int(np.median(rest))} for the rest "
-              f"<- few samples = rote memorization", flush=True)
-        deep_info = dict(deep_n_bits=int(dmask.sum()), n_bits_total=int(len(dmask)),
-                         deep_frac_actual=float(dmask.mean()),
-                         deep_depth_min=int(depths[dmask].min()),
-                         deep_depth_max=int(depths[dmask].max()),
-                         deep_median_samples=int(np.median(tgt)),
-                         rest_median_samples=int(np.median(rest)))
-        if args.deep_delete:
-            for k in enc:
-                enc[k][:, dmask] = 0.0
-            print(f"[deep] DELETE mode: those bits are zeroed everywhere "
-                  f"(train + val + test)", flush=True)
-        else:
-            pvec = np.where(dmask, args.deep_flip_p, 0.0).astype(np.float32)
-            noise_pack = {"kind": "bit_flip", "bits": encode_margins(M_train, 0.0),
-                          "maskscale": maskscale, "pvec": pvec}
-            print(f"[deep] FLIP mode: each targeted bit flips 0<->1 with "
-                  f"p={args.deep_flip_p:g}, fresh every batch (train only; "
-                  f"p=0.5 = pure coin flips)", flush=True)
-    if args.flip_ramp > 0 or args.flip_uniform > 0:
-        depths, _samp = node_depths_and_samples(rf)
-        if args.flip_ramp > 0:
-            pvec = (args.flip_ramp * depths / depths.max()).astype(np.float32)
-            mode = f"RAMP p(depth) = {args.flip_ramp:g} * depth/{int(depths.max())}"
-        else:
-            pvec = np.full(len(depths), args.flip_uniform, dtype=np.float32)
-            mode = f"UNIFORM p = {args.flip_uniform:g} on every bit"
-        per_depth = {int(d): (float(pvec[depths == d][0]), int((depths == d).sum()))
-                     for d in np.unique(depths)}
-        print(f"[flip] {mode}; train-only, fresh each batch, bits stay binary", flush=True)
-        print("[flip] per depth (p, #bits): " + ", ".join(
+        what = (f"delete {args.deep_select} layers {deep_layers}" if deep_layers
+                else f"delete {args.deep_select} {args.deep_frac:.0%}")
+    if del_mask is not None:
+        tgt, rest = all_samples[del_mask], all_samples[~del_mask]
+        kept_depths = sorted(set(all_depths[~del_mask].tolist()))
+        print(f"[bits] {what}: deleting {int(del_mask.sum())}/{len(del_mask)} bits "
+              f"({del_mask.mean():.1%}), keeping {int((~del_mask).sum())} at depths "
+              f"{kept_depths}", flush=True)
+        print(f"[bits] median training rows per node: {int(np.median(tgt))} deleted "
+              f"vs {int(np.median(rest))} kept "
+              f"<- few rows per split = the memorised end of the forest", flush=True)
+        for k in enc:
+            enc[k][:, del_mask] = 0.0
+        deep_info.update(
+            deep_n_bits=int(del_mask.sum()), n_bits_total=int(len(del_mask)),
+            deep_frac_actual=float(del_mask.mean()),
+            kept_n_bits=int((~del_mask).sum()), kept_depths=kept_depths,
+            deep_median_samples=int(np.median(tgt)),
+            rest_median_samples=int(np.median(rest)))
+
+    # ---- step 2: which bits get FLIPPED during training, and how often ----
+    # p is per-bit, resampled every batch; evaluation always uses clean bits.
+    pvec = None
+    if args.flip_ramp > 0:
+        # Perturb more where the forest is least trustworthy: p grows with depth,
+        # so the root splits (fit on every row) are never touched.
+        denom = max_depth
+        if args.flip_ramp_rel and del_mask is not None:
+            denom = max(1, int(all_depths[~del_mask].max()))
+        pvec = (args.flip_ramp * all_depths / denom).astype(np.float32)
+        mode = (f"RAMP p(depth) = {args.flip_ramp:g} x depth/{denom}"
+                f"{'  (relative to the deepest surviving layer)' if denom != max_depth else ''}")
+    elif args.flip_uniform > 0:
+        pvec = np.full(len(all_depths), args.flip_uniform, dtype=np.float32)
+        mode = f"UNIFORM p = {args.flip_uniform:g} on every bit"
+    elif args.deep_flip_p > 0:
+        tmask, _, _ = select_bits(
+            rf, frac=None if deep_layers else args.deep_frac, layers=deep_layers,
+            select=args.deep_select, seed=args.seed)
+        pvec = np.where(tmask, args.deep_flip_p, 0.0).astype(np.float32)
+        mode = (f"TARGETED p = {args.deep_flip_p:g} on {int(tmask.sum())} "
+                f"{args.deep_select} bits")
+    if pvec is not None:
+        flip_base = encode_margins(M_train, 0.0)
+        if del_mask is not None:
+            # A deleted bit stays deleted: never flip it, and keep its column at 0
+            # so a flip could not resurrect it.
+            pvec = pvec.copy()
+            pvec[del_mask] = 0.0
+            flip_base[:, del_mask] = 0.0
+        live = pvec > 0
+        print(f"[flip] {mode}; train-only, resampled every batch, bits stay binary",
+              flush=True)
+        per_depth = {int(d): (float(pvec[all_depths == d].mean()),
+                              int((all_depths == d).sum()))
+                     for d in np.unique(all_depths)}
+        print("[flip] mean p by depth (p, #bits): " + ", ".join(
             f"d{d}: ({pp:.3f}, {nn})" for d, (pp, nn) in per_depth.items()), flush=True)
-        print(f"[flip] average flip rate over all {len(pvec)} bits = {pvec.mean():.4f} "
-              f"<- the matched uniform control uses this number", flush=True)
-        deep_info = dict(n_bits_total=int(len(pvec)), flip_mean_p=float(pvec.mean()),
-                         flip_per_depth={str(d): pp for d, (pp, _) in per_depth.items()})
-        noise_pack = {"kind": "bit_flip", "bits": encode_margins(M_train, 0.0),
+        print(f"[flip] {int(live.sum())} bits can flip; mean p over ALL "
+              f"{len(pvec)} bits = {pvec.mean():.4f} "
+              f"<- a matched uniform control uses this number", flush=True)
+        noise_pack = {"kind": "bit_flip", "bits": flip_base,
                       "maskscale": maskscale, "pvec": pvec}
+        deep_info.update(n_bits_total=int(len(pvec)), flip_mean_p=float(pvec.mean()),
+                         flip_n_live=int(live.sum()),
+                         flip_per_depth={str(d): pp for d, (pp, _) in per_depth.items()})
 
     # -------- tree ceiling (reference) --------
     print("[ceiling] fitting tree baselines ...", flush=True)
@@ -690,6 +734,7 @@ def main():
                    deep_frac=args.deep_frac, deep_flip_p=args.deep_flip_p,
                    deep_delete=bool(args.deep_delete),
                    deep_select=args.deep_select, deep_layers=deep_layers,
+                   keep_layers=keep_layers, flip_ramp_rel=bool(args.flip_ramp_rel),
                    flip_ramp=args.flip_ramp, flip_uniform=args.flip_uniform,
                    **deep_info,
                    ensemble=args.ensemble,
