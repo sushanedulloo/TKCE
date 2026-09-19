@@ -61,9 +61,14 @@ def main():
     ap.add_argument("--rf-min-leaf", type=int, default=5)
     ap.add_argument("--encoding", default="oob", choices=["oob", "infold"])
     ap.add_argument("--C", type=float, nargs="+",
-                    default=[0.003, 0.01, 0.03, 0.1, 0.3, 1.0],
-                    help="inverse regularisation strengths; the best on "
-                         "VALIDATION is reported on test")
+                    default=[1e-4, 3e-4, 1e-3, 3e-3, 0.01, 0.03, 0.1, 0.3, 1.0],
+                    help="inverse regularisation strengths (C = 1/lambda, so SMALL "
+                         "C = strong regularisation); log-spaced in ~3x steps. The "
+                         "best on VALIDATION is reported on test. The grid reaches "
+                         "well below the useful range on purpose: with ~5,400 bits "
+                         "and ~11,200 rows the optimum sits at the strongly "
+                         "regularised end, and a grid that stops too early would "
+                         "understate the signal")
     ap.add_argument("--max-iter", type=int, default=2000)
     ap.add_argument("--out", default="results/linear_probe")
     args = ap.parse_args()
@@ -115,10 +120,22 @@ def main():
                             test_auc=roc_auc_score(
                                 ds.y_test, lr.predict_proba(Xte)[:, 1]))
         best.update(view=view, n_features=int(Xtr.shape[1]))
+        # A winner at either end of the grid means the optimum may lie outside it,
+        # so the reported score is a lower bound on what a linear model can do.
+        lo, hi = min(args.C), max(args.C)
+        edge = ("low" if best["C"] == lo and len(args.C) > 1 else
+                "high" if best["C"] == hi and len(args.C) > 1 else None)
+        best["C_at_grid_edge"] = edge
         results.append(best)
         print(f"  -> {view:8s} TEST auc={best['test_auc']:.4f} "
               f"(C={best['C']}, train {best['train_auc']:.4f}, "
               f"val {best['val_auc']:.4f})", flush=True)
+        if edge == "low":
+            print(f"     [!] best C is the SMALLEST tried ({lo:g}) — the optimum may "
+                  f"be below the grid; rerun with smaller --C to be sure", flush=True)
+        elif edge == "high":
+            print(f"     [!] best C is the LARGEST tried ({hi:g}) — the optimum may "
+                  f"be above the grid; rerun with larger --C to be sure", flush=True)
 
     # ---- verdict ----
     by = {r["view"]: r for r in results}
@@ -130,6 +147,10 @@ def main():
         print(f"  {r['view']:10s} {r['n_features']:9d} {r['train_auc']:8.4f} "
               f"{r['val_auc']:8.4f} {r['test_auc']:8.4f}")
     print(f"  {'best tree':10s} {'':9s} {'':8s} {'':8s} {tree_ceiling:8.4f}")
+    edged = [r["view"] for r in results if r.get("C_at_grid_edge")]
+    if edged:
+        print(f"\n  [!] C landed on the edge of the grid for: {', '.join(edged)}"
+              f"  (grid was {min(args.C):g} .. {max(args.C):g})")
     print()
     lift = by["tree"]["test_auc"] - by["x"]["test_auc"]
     print(f"  tree bits alone, with NO raw features and NO hidden layer: "
