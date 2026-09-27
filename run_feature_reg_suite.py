@@ -98,8 +98,20 @@ def run_all(root, datasets, arms, quick):
         print(f"\n[suite] {i:2d}/{len(todo)} {name} ({kind}) :: {label}  "
               f"[{time.strftime('%H:%M:%S')}]", flush=True)
         t0 = time.time()
-        r = subprocess.run(cmd)
-        status = "ok" if r.returncode == 0 else f"FAILED (exit {r.returncode})"
+        os.makedirs(out, exist_ok=True)
+        # Stream the run's output to the console AND keep a complete copy as the
+        # run's training log, so every number in the tables has its provenance.
+        with open(os.path.join(out, "run.log"), "w") as lf:
+            lf.write(f"# {name} :: {label}\n# {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                     f"# {' '.join(cmd)}\n\n")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                lf.write(line)
+            proc.wait()
+            lf.write(f"\n# exit {proc.returncode} after {time.time() - t0:.0f}s\n")
+        status = "ok" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
         print(f"[suite] {name} :: {label} -> {status} in {time.time() - t0:.0f}s",
               flush=True)
     print(f"\n[suite] all runs finished in {(time.time() - t_all) / 60:.1f} min",
@@ -215,6 +227,137 @@ def figure(t, path):
     print(f"[suite] figure -> {path}")
 
 
+def per_dataset_outputs(t, root):
+    """For each dataset: its own arms table (CSV) and a two-panel bar figure."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    BLUE, ORANGE, AQUA, VIOLET, MUTED = "#2a78d6", "#eb6834", "#1baf7a", "#4a3aa7", "#52514e"
+    fam_col = {"00": MUTED, "10": ORANGE, "21": ORANGE, "20": AQUA, "30": BLUE,
+               "31": BLUE, "40": BLUE, "33": VIOLET}
+    for ds, g in t.groupby("dataset", sort=False):
+        d = os.path.join(root, ds)
+        g = g.sort_values(["arm", "view"])
+        cols = ["arm", "view", "bits", "kept_depths", "mean_p", "train", "val", "test",
+                "gap", "tree_ceiling", "best_tree", "seconds"]
+        extra = [c for c in g.columns if c.startswith(("train_", "val_", "test_"))]
+        g[cols + extra].round(5).to_csv(os.path.join(d, "summary.csv"), index=False)
+        gt = g[g.view == "tree"]
+        if gt.empty:
+            continue
+        prim = gt.primary.iloc[0]
+        fig, ax = plt.subplots(1, 2, figsize=(11, 0.55 * len(gt) + 2.2))
+        labels = [a.split("_", 1)[1] for a in gt.arm]
+        colors = [fam_col.get(a[:2], MUTED) for a in gt.arm]
+        for a_, col, ttl in [(ax[0], "test", f"test {prim}"), (ax[1], "gap", "train - val gap")]:
+            a_.barh(range(len(gt)), gt[col], color=colors, edgecolor="white")
+            for i, v in enumerate(gt[col]):
+                a_.text(v, i, f" {v:.4f}", va="center", fontsize=8)
+            a_.set_yticks(range(len(gt)))
+            a_.set_yticklabels(labels, fontsize=8)
+            a_.invert_yaxis()
+            a_.grid(alpha=.25, axis="x")
+            a_.set_title(ttl, fontweight="bold", loc="left", fontsize=10)
+        ax[0].axvline(gt.tree_ceiling.iloc[0], ls="--", color=MUTED, lw=1.2)
+        lo = min(gt.test.min(), gt.tree_ceiling.iloc[0])
+        hi = max(gt.test.max(), gt.tree_ceiling.iloc[0])
+        pad = max(0.01, (hi - lo) * 0.5)
+        ax[0].set_xlim(lo - pad, hi + pad * 0.6)
+        fig.suptitle(f"{ds}  ({gt.task_type.iloc[0]}"
+                     f"{', %d classes' % gt.n_classes.iloc[0] if gt.n_classes.iloc[0] > 2 else ''}"
+                     f")   dashed = best tree {gt.tree_ceiling.iloc[0]:.4f} ({gt.best_tree.iloc[0]})",
+                     fontsize=10, x=0.01, ha="left")
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        fig.savefig(os.path.join(d, "figure.png"), dpi=140)
+        plt.close(fig)
+
+
+def write_workbook(t, v, root):
+    """One Excel file: verdict, long table, and a sheet per dataset."""
+    path = os.path.join(root, "suite_results.xlsx")
+    try:
+        with pd.ExcelWriter(path) as xw:
+            v.to_excel(xw, sheet_name="verdict", index=False)
+            t.round(5).to_excel(xw, sheet_name="all_runs", index=False)
+            for ds, g in t.groupby("dataset", sort=False):
+                g.round(5).to_excel(xw, sheet_name=ds[:31], index=False)
+        print(f"[suite] workbook -> {path}")
+    except Exception as exc:  # noqa: BLE001 - openpyxl missing, etc.
+        print(f"[suite] workbook skipped ({exc}); the CSVs hold the same data")
+
+
+README = """FEATURE REGULARISATION SUITE -- results bundle
+=================================================
+
+What was tested
+  The same eight feature-regularisation arms, with every experimental factor
+  held identical, on datasets spanning binary classification, multi-class
+  classification and regression. The head is a convex linear model solved to
+  the global optimum (logistic regression, or Ridge for regression) on the
+  split bits of a frozen random forest under the out-of-bag honest protocol.
+
+Fixed factors (identical on every dataset and arm)
+  forest: 100 trees, max depth 6, min samples per leaf 5
+  encoding: out-of-bag honest (training rows keep bits only from trees that
+            never saw them; validation and test keep all trees)
+  head: C = 0.01 (Ridge alpha = 1/(2C) = 50 for regression); for noise arms
+        the penalty is rescaled by the number of stacked copies so the
+        strength per original training row is unchanged
+  noise: 3 independently flipped copies of the training rows, stacked
+  rows: at most 16,000 per dataset; seed 0; stratified split 70/15/15
+
+Arms
+  00_baseline          all bits, no perturbation (also the raw-feature floor)
+  10_unif_0.2          every bit flipped with probability 0.2
+  20_ramp_0.2          flip probability grows with depth: 0.2 x depth / 5
+  21_ctrl_0.16         uniform 0.16 = the same average budget as ramp 0.2
+  30_drop_L5           the deepest layer deleted
+  31_drop_L45          the two deepest layers deleted
+  33_drop_L45_ramp02   drop depths 4,5 then ramp 0.2 over the survivors
+  40_keep_L012         only depths 0, 1, 2 kept
+
+Files
+  suite_verdict.csv    one row per dataset: tree ceiling, raw-feature floor,
+                       baseline train/test/gap, keep-0-2 train/test/gap, the
+                       change in test, the gap ratio, and "holds" = yes when
+                       keep-0-2 is within 0.01 of the baseline on test AND
+                       has a smaller gap. ramp_minus_ctrl <= 0 means the depth
+                       shape did not beat uniform noise at equal budget.
+  suite_long.csv       every arm, every view, every split, every metric
+  suite_results.xlsx   the same tables as an Excel workbook, one sheet per
+                       dataset
+  suite_overview.png   cross-dataset figure: change in test vs baseline per
+                       arm (grey band = within 0.01), and gap / baseline gap
+  suite.log            the full console log of the run
+  <dataset>/summary.csv        that dataset's arms table
+  <dataset>/figure.png         that dataset's test metric and gap by arm
+  <dataset>/<arm>/run.log      the complete training log of that run
+  <dataset>/<arm>/featreg_<dataset>.json   the machine-readable result
+
+How to read a gap
+  gap = train metric minus validation metric on the primary metric (AUC, or
+  R^2 for regression), with the training metric measured on CLEAN bits so it
+  is comparable between arms. A gap near zero or negative means no measurable
+  overfitting. Classification tables also carry accuracy and log-loss on all
+  three splits; regression tables carry RMSE and MAE on the original scale.
+
+Reproduce
+  python run_feature_reg_suite.py            (repo: github.com/sushanedulloo/TKCE)
+"""
+
+
+def bundle(root):
+    """Zip the whole results tree into one dated archive next to it."""
+    import shutil
+    stamp = time.strftime("%Y%m%d")
+    base = os.path.join(os.path.dirname(os.path.abspath(root)) or ".",
+                        f"featreg_suite_{stamp}")
+    path = shutil.make_archive(base, "zip", root_dir=os.path.dirname(os.path.abspath(root)),
+                               base_dir=os.path.basename(os.path.abspath(root)))
+    print(f"[suite] bundle -> {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+    return path
+
+
 def aggregate(root):
     t = load_rows(root)
     if t.empty:
@@ -223,6 +366,10 @@ def aggregate(root):
     t.to_csv(os.path.join(root, "suite_long.csv"), index=False)
     v = verdict_table(t)
     v.to_csv(os.path.join(root, "suite_verdict.csv"), index=False)
+    per_dataset_outputs(t, root)
+    write_workbook(t, v, root)
+    with open(os.path.join(root, "README.txt"), "w") as f:
+        f.write(README)
     pd.set_option("display.width", 250)
     print("\n" + "=" * 100)
     print("PER-DATASET VERDICT  (train / test on the primary metric; gap = train - val on CLEAN bits)")
@@ -235,6 +382,8 @@ def aggregate(root):
           "(<= 0 means the depth shape did not help)")
     print("\nFULL LONG TABLE (every arm, every split, every metric) -> suite_long.csv")
     figure(t, os.path.join(root, "suite_overview.png"))
+    print(f"[suite] per-dataset summary.csv + figure.png written under {root}/<dataset>/")
+    print(f"[suite] README.txt written; per-run training logs are in <dataset>/<arm>/run.log")
 
 
 def main():
@@ -246,6 +395,9 @@ def main():
     ap.add_argument("--arms", default=None, help="comma-separated subset of arm labels")
     ap.add_argument("--quick", action="store_true", help="smoke-test settings")
     ap.add_argument("--aggregate-only", action="store_true")
+    ap.add_argument("--bundle", action="store_true",
+                    help="after aggregating, zip the whole results tree into one "
+                         "dated archive for download")
     args = ap.parse_args()
 
     datasets = DATASETS
@@ -260,6 +412,8 @@ def main():
     if not args.aggregate_only:
         run_all(args.root, datasets, arms, args.quick)
     aggregate(args.root)
+    if args.bundle:
+        bundle(args.root)
 
 
 if __name__ == "__main__":

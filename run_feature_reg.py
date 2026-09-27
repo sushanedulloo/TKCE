@@ -44,6 +44,8 @@ import json
 import os
 import time
 
+import warnings
+
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, Ridge
@@ -54,6 +56,10 @@ from run_fusion import (encode_margins, node_depths_and_samples, oob_mask_matrix
 from tkce.baselines import fit_tree_baseline
 from tkce.data import load_task
 from tkce.metrics import primary_metric, score
+
+# LightGBM re-emits this on every predict; it carries no information and would
+# bury the real content of the per-run training logs.
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 
 # --------------------------------------------------------------------------- #
