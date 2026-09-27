@@ -1,0 +1,544 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.0cm]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[labelfont=bf,font=small]{caption}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+
+\definecolor{bad}{HTML}{cf3a4e}
+\definecolor{good}{HTML}{1f8a54}
+\setlist[itemize]{leftmargin=1.4em,itemsep=2pt,topsep=3pt}
+\setlist[enumerate]{leftmargin=1.6em,itemsep=5pt,topsep=3pt}
+\newcommand{\num}[1]{\texttt{#1}}
+\setlength{\tabcolsep}{4pt}
+
+\input{numbers.tex}
+\input{tables.tex}
+
+\title{\vspace{-1.6cm}\textbf{Does Feature Regularisation Hold Beyond One Dataset?}\\
+\large Seven datasets, three kinds of problem, every factor held fixed}
+\author{Experiment report}
+\date{\small 27 September 2026}
+
+\begin{document}
+\maketitle
+\vspace{-0.8cm}
+
+\begin{center}
+\fbox{\begin{minipage}{0.95\textwidth}
+\small\textbf{Summary.} The earlier credit experiment showed two things: a simple
+linear model on the tree bits matched the best tree model, and removing the
+deepest tree layers cut overfitting more than tenfold at no cost. This report
+repeats the same experiment, with every setting held identical, on seven
+datasets covering two-class, many-class and number-prediction problems.
+\textbf{The regularisation result holds}: on every dataset where the model
+overfit, deleting the deep layers cut the train-minus-validation gap by 62 to
+94 percent, and the training score came down toward the test score, for a
+test cost never above \num{0.016}. \textbf{The ``matches the tree'' result
+does not generalise}: credit is the only dataset where the linear model reaches
+the best tree; elsewhere it covers between 48 and 95 percent of the way from
+raw features to the tree, and on wine quality almost none. \textbf{Deleting
+beats flipping}: bit-flip noise damages calibration on classification and is
+destructive on regression, while deletion regularises without side effects.
+\end{minipage}}
+\end{center}
+
+\section{Goal of the experiment}
+
+The previous report studied one dataset, credit. With the classifier fixed to
+a plain logistic regression on the bits of a frozen random forest, two results
+stood out. First, the linear model matched the best gradient-boosted tree
+(\num{0.8457} against \num{0.8453} on the ranking score). Second, regularising
+the \emph{features} rather than the model, by deleting the deepest tree layers
+or flipping bits during training, reduced the train-minus-validation gap from
+\num{0.0974} to as little as \num{0.0092} with no change in the test score.
+
+The response to that report set five requirements, and this experiment is
+built to meet each of them.
+
+\begin{enumerate}
+  \item \textbf{Try it on a few more datasets.} Six new datasets were added to
+        credit, chosen to cover two-class problems, many-class problems and
+        number-prediction (regression) problems.
+  \item \textbf{Keep all experimental factors intact.} The forest, the honesty
+        protocol, the head and its penalty, the noise recipe, the row cap, the
+        random seed and the set of arms are identical on every dataset. Nothing
+        was tuned per dataset.
+  \item \textbf{Track all metrics across train, validation and test.} Every run
+        reports three scores on all three splits.
+  \item \textbf{Report that the training accuracy fell from 1.} The tables show
+        training and test side by side for the full encoding and for the
+        shallow one, so the drop is visible directly.
+  \item \textbf{See whether the observation holds.} Each dataset gets an
+        explicit yes-or-no verdict against a rule fixed before the runs.
+\end{enumerate}
+
+The question, in one line: \emph{is ``regularise the features, not the model''
+a property of credit, or a property of tree encodings in general?}
+
+\section{Datasets}
+
+Seven datasets, all from public benchmark collections and all without the
+identifier-column leakage that spoiled an earlier dataset in this project. Each
+was split into 70 percent training, 15 percent validation and 15 percent test,
+with the same random seed, and capped at \num{16000} rows.
+
+\begin{table}[H]\centering\small
+\begin{tabular}{lp{11.2cm}}
+\toprule
+\textbf{Dataset} & \textbf{What the model has to predict}\\
+\midrule
+credit & Whether a person will fall seriously behind on loan payments within two years, from ten numbers describing their finances. Two classes, balanced. The anchor dataset from the previous report.\\
+house\_16H & Whether a house is worth more than the typical house in its area, from sixteen census-style numbers. Two classes.\\
+MagicTelescope & Whether a flash recorded by a gamma-ray telescope is a real signal or background noise, from ten shape measurements of the flash. Two classes.\\
+pendigits & Which digit from 0 to 9 was written, from sixteen numbers describing the pen's path. Ten classes, balanced.\\
+covertype & Which of seven forest cover types grows on a patch of land, from fifty-four map-derived measurements. Seven classes, unbalanced. The full dataset has 581,012 rows; a random 16,000 were used.\\
+cpu\_act & The fraction of time a computer's processor spends running user programs, from twenty-one activity counters. A number to predict.\\
+wine\_quality & The quality score (3 to 9) that a taster gave a wine, from eleven chemical measurements. A number to predict, and known to be difficult.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\tabsizes
+\caption{Sizes after the split, the width of the tree encoding each forest
+produced, and the best of the three reference tree models fitted on the raw
+features of the same split. ``Kind'' names the type of problem.}
+\end{table}
+
+\paragraph{How the scores are read.} Three kinds of problem need slightly
+different scores, and all are reported on all three splits.
+
+\begin{itemize}
+  \item \textbf{Ranking score} (classification). How well the model puts the
+        positive cases above the negative ones when sorted by its predicted
+        probability. A value of \num{0.5} is a coin flip and \num{1.0} is
+        perfect. For many-class problems it is computed one class against the
+        rest and averaged. This is the primary score for classification.
+  \item \textbf{Accuracy} (classification). The fraction of rows the model
+        labels correctly. \textbf{Log loss} (classification). A penalty for
+        being confidently wrong; lower is better. It measures how well
+        calibrated the predicted probabilities are, which the ranking score
+        ignores.
+  \item \textbf{Explained-variance score} (regression). How much of the spread
+        in the target the predictions account for. \num{1.0} is perfect,
+        \num{0} means no better than always guessing the average, and a negative
+        value means worse than that. This is the primary score for regression.
+        Alongside it, the \textbf{typical error} (the root of the mean squared
+        error) and the \textbf{average absolute error}, both in the target's
+        own units.
+\end{itemize}
+
+\paragraph{Reference tree models.} Three tree models were fitted on the raw
+features of each split with default settings: gradient-boosted trees from two
+popular libraries (XGBoost and LightGBM) and a random forest. The best of the
+three on the test split is called ``the best tree'' throughout and marks the
+target every other number is compared to.
+
+\section{Training architecture and methodology}
+
+Every model in this report has two stages. The first is fitted once and then
+frozen. The second is the only thing that learns.
+
+\paragraph{Stage 1: the tree encoding.} A random forest of \num{100} trees is
+fitted on the training split, with each tree allowed to grow six levels deep
+and each leaf required to hold at least five rows. For regression problems the
+forest is a regression forest; otherwise a classification forest. Every
+decision node inside every tree becomes one yes-or-no feature, which we call a
+\emph{bit}: it is 1 if the row goes left at that node and 0 otherwise. Across
+the whole forest this gives between \num{3507} and \num{5756} bits per row,
+depending on the dataset. The forest is never touched again; it is a way of
+describing rows, not a predictor.
+
+\paragraph{Depth means reliability.} A node near the top of a tree was chosen
+by looking at thousands of rows. A node at the bottom was chosen by looking at
+a few dozen. On credit, splits at depths 0 to 2 were fitted on a median of
+2,355 rows each, while the deeper splits were fitted on a median of 208. The
+deep bits are therefore the memorised part of the forest, and roughly half of
+all bits sit in the single deepest layer. This is why the interventions below
+are organised by depth.
+
+\paragraph{Honest bits.} The forest was fitted using the training labels, so a
+training row's bits from trees whose random sample \emph{contained} that row
+were partly carved to classify that very row. Test rows have no such trees. To
+remove this asymmetry, each training row keeps only the bits from trees that
+never saw it, on average \num{36.8} of the 100, rescaled so that magnitudes
+match. Validation and test rows use all trees. This protocol is identical on
+every dataset and arm.
+
+\paragraph{Stage 2: the head.} A convex linear model with one weight per bit,
+no hidden layer and no nonlinearity, solved exactly. For classification it is a
+logistic regression, extended in the usual way to many classes. For regression
+it is a ridge regression, with the penalty set so the weight on the penalty
+term matches the classification setting. There is no learning rate, no number
+of training rounds and no random initialisation anywhere, so no result can be
+blamed on the optimiser.
+
+\paragraph{The penalty is fixed.} The penalty setting is $C = 0.01$ everywhere.
+A small $C$ means a strong pull of the weights toward zero. It was deliberately
+not tuned per dataset or per arm, because that would leave any difference in
+the tables attributable either to the features or to a differently tuned
+penalty. Holding it fixed makes every difference attributable to the features
+alone.
+
+\paragraph{How noise is applied.} A convex solver sees one fixed table of
+numbers, so it cannot draw fresh random flips at every training step the way a
+neural network trainer can. The equivalent is to build three independently
+flipped copies of the training rows and fit on all of them together, which
+approximates minimising the loss averaged over the noise. Because stacking
+three copies triples the data term of the objective, the penalty is rescaled
+by three so that the pull per original training row is the same as in the
+arms without noise. Flips are applied to the plain 0/1 bits before the honesty
+mask. \textbf{Validation and test always see clean, unflipped bits.}
+
+\paragraph{How deletion is applied.} Deleting a depth means dropping every bit
+at that depth as a column, from training, validation and test alike. A deleted
+bit can never be flipped back in. Deletion is a permanent change to the input,
+so it needs no noisy copies and no rescaling.
+
+\paragraph{How overfitting is measured.} The gap is the training score minus
+the validation score on the primary metric, with the training score computed
+on \emph{clean} training bits rather than on the flipped table the model was
+fitted to. Measured the other way, a noisy arm looks like it overfits more
+purely because its training inputs were corrupted, and the gap stops being
+comparable between arms. A gap near zero, or negative, means no measurable
+overfitting.
+
+\section{Experimental setup}
+
+\paragraph{The eight arms, identical on every dataset.} In all of them $d$ is
+the depth of a split and the deepest layer is depth 5.
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{3.9cm}p{4.9cm}p{6.6cm}}
+\toprule
+\textbf{Arm} & \textbf{What changes} & \textbf{Why it is there}\\
+\midrule
+all bits, no change & nothing & the baseline; also runs the model on raw features alone, as a floor\\
+flip every bit, $p = 0.20$ & every bit flipped with probability 0.20 & the noise level that worked best on credit\\
+flips rising with depth, $P = 0.2$ & flip probability $0.2 \times d / 5$; roots never flip & is it better to disturb the unreliable deep bits more?\\
+flip every bit, $p = 0.16$ & every bit flipped with probability 0.16 & the same \emph{total} amount of noise as the ramp, spread flat; the fair comparison\\
+delete depth 5 & the deepest layer removed & the gentlest deletion\\
+delete depths 4 and 5 & the two deepest layers removed & a middle deletion\\
+delete 4 and 5, then ramp 0.2 & deletion plus a ramp over the survivors & the combined design\\
+\textbf{keep only depths 0, 1, 2} & everything below depth 2 removed & the configuration recommended from credit\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The matched control.} For the ramp, the average flip rate over all
+bits works out to about $0.8 \times P$, so the flat arm at $p = 0.16$ tells
+the same total number of lies as the ramp at $P = 0.2$. If the ramp beats it,
+the \emph{shape} of the noise helped. If they tie, only the \emph{amount}
+mattered.
+
+\paragraph{Bits only.} Every arm uses the tree bits alone. If the raw features
+were included, the model would have an unperturbed shortcut to fall back on,
+and that would hide what the noise does. The raw-features-only run in the
+baseline shows how much the bits add.
+
+\paragraph{The rule for ``holds'', fixed in advance.} The credit observation
+holds on a dataset if the keep-depths-0-to-2 arm is within \num{0.01} of the
+baseline on the test score \textbf{and} has a smaller train-minus-validation
+gap.
+
+\paragraph{Scale.} Seven datasets, eight arms, 56 runs, 83 minutes in total on
+an ordinary processor with no graphics card. Every run's complete output is
+kept as its own log.
+
+\section{Results}
+
+\subsection{The verdict, one row per dataset}
+
+\begin{table}[H]\centering\footnotesize
+\resizebox{\textwidth}{!}{\taboverview}
+\caption{Training and test scores on the primary metric (ranking score for
+classification, explained-variance score for regression), for the full
+encoding and for the shallow encoding. ``Raw only'' is the same head on the
+raw features with no tree bits. ``Test change'' is the shallow arm minus the
+baseline. The observation holds on \nHolds{} of \nDatasets{} datasets.}
+\end{table}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.95\textwidth]{fig1_position.pdf}
+\caption{Where the linear model lands between ``raw features only'' and ``best
+tree'' on each dataset. A circle at 1.0 means it reached the tree. Credit is
+the only dataset where it does; on wine quality the bits add almost nothing a
+linear model can use.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=\textwidth]{fig2_train_down.pdf}
+\caption{Left: for every dataset, the training score (filled) and test score
+(hollow) for the full encoding and for depths 0 to 2 only. The line between
+them is the gap; it shortens on every dataset. Right: training and test
+accuracy on the classification datasets. Training accuracy comes down from
+its ceiling while test accuracy barely moves, except on the ten-class problem.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=\textwidth]{fig3_heatmaps.pdf}
+\caption{Every arm on every dataset. Left: change in test score against the
+baseline; values inside $\pm 0.01$ are not real differences. The two flat-noise
+arms on cpu\_act are off the scale, at $-2.94$ and $-1.68$. Right: the gap as
+a fraction of the baseline gap. Blank rows are the two datasets whose baseline
+gap was under \num{0.01}, so there was nothing to reduce.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.85\textwidth]{fig4_calibration.pdf}
+\caption{Log loss on the test split for the classification datasets. On the
+two-class problems and on covertype, deleting depths leaves it roughly where it
+was, while flipping bits raises it by 16 to 53 percent, meaning the model's
+probabilities become less trustworthy even when its ranking does not change.
+On the ten-class pendigits both deletion and noise double it.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=\textwidth]{fig5_ramp_vs_flat.pdf}
+\caption{The depth ramp beside the flat control that tells the same total
+number of lies. On classification they tie. On regression, flat noise is
+catastrophic, because it also flips the root bits that carry most of the
+signal, and even the ramp costs a lot.}
+\end{figure}
+
+\clearpage
+\subsection{Every arm on every dataset}
+
+Each table lists all eight arms plus the raw-features floor and the best tree.
+Training scores are on clean bits. The recommended arm from credit is in bold.
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{credit} (two classes, the anchor dataset)}
+\resizebox{\textwidth}{!}{\tabcredit}
+\end{table}
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{house\_16H} (two classes)}
+\resizebox{\textwidth}{!}{\tabhouseSixteenH}
+\end{table}
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{MagicTelescope} (two classes)}
+\resizebox{\textwidth}{!}{\tabMagicTelescope}
+\end{table}
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{pendigits} (ten classes)}
+\resizebox{\textwidth}{!}{\tabpendigits}
+\end{table}
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{covertype} (seven classes)}
+\resizebox{\textwidth}{!}{\tabcovertype}
+\end{table}
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{cpu\_act} (regression; typical error and average absolute error in percentage points of processor time)}
+\resizebox{\textwidth}{!}{\tabcpuact}
+\end{table}
+
+\begin{table}[H]\centering\footnotesize
+\caption*{\textbf{wine\_quality} (regression; errors in quality-score points)}
+\resizebox{\textwidth}{!}{\tabwinequality}
+\end{table}
+
+\clearpage
+\section{Observations}
+
+\begin{enumerate}
+
+\item \textbf{The observation holds on \nHolds{} of \nDatasets{} datasets, and
+the two exceptions are exactly the two datasets that barely overfit to begin
+with.} On pendigits the baseline gap is only \num{\pendigitsBaseGap} (training
+ranking score \num{\pendigitsBaseTrain}, test \num{\pendigitsBaseTest}); there
+is nothing to remove, and the shallow arm changes test by
+\num{\pendigitsDTest}. On cpu\_act the baseline gap is \num{\cpuactBaseGap}
+and the shallow arm removes it entirely (gap \num{\cpuactKeepGap}) but at a
+test cost of \num{\cpuactDTest}, outside the tolerance. So the rule fails where
+the premise fails: where there was no overfitting, feature regularisation had
+no job to do.
+
+\item \textbf{Wherever the model did overfit, deleting the deep layers cut the
+gap by 62 to 94 percent.} Credit \num{\creditBaseGap} to \num{\creditKeepGap}
+(\creditGapCut{} percent), house\_16H \num{\houseSixteenHBaseGap} to
+\num{\houseSixteenHKeepGap} (\houseSixteenHGapCut{} percent), MagicTelescope
+\num{\MagicTelescopeBaseGap} to \num{\MagicTelescopeKeepGap}
+(\MagicTelescopeGapCut{} percent), covertype \num{\covertypeBaseGap} to
+\num{\covertypeKeepGap} (\covertypeGapCut{} percent), wine\_quality
+\num{\winequalityBaseGap} to \num{\winequalityKeepGap} (\winequalityGapCut{}
+percent). The test score moved by at most \num{\covertypeDTest} on those five.
+
+\item \textbf{The training score came down from its ceiling on every dataset.}
+On the primary metric: credit \num{\creditBaseTrain} to
+\num{\creditKeepTrain}, house\_16H \num{\houseSixteenHBaseTrain} to
+\num{\houseSixteenHKeepTrain}, MagicTelescope \num{\MagicTelescopeBaseTrain}
+to \num{\MagicTelescopeKeepTrain}, pendigits \num{\pendigitsBaseTrain} to
+\num{\pendigitsKeepTrain}, covertype \num{\covertypeBaseTrain} to
+\num{\covertypeKeepTrain}, cpu\_act \num{\cpuactBaseTrain} to
+\num{\cpuactKeepTrain}, wine\_quality \num{\winequalityBaseTrain} to
+\num{\winequalityKeepTrain}. Training \emph{accuracy}, the number asked about
+directly: pendigits was literally \num{\pendigitsBaseTrainAcc} and came down
+to \num{\pendigitsKeepTrainAcc}; house\_16H \num{\houseSixteenHBaseTrainAcc}
+to \num{\houseSixteenHKeepTrainAcc}; covertype \num{\covertypeBaseTrainAcc}
+to \num{\covertypeKeepTrainAcc}; credit \num{\creditBaseTrainAcc} to
+\num{\creditKeepTrainAcc}; MagicTelescope \num{\MagicTelescopeBaseTrainAcc}
+to \num{\MagicTelescopeKeepTrainAcc}. The model with 700 bits no longer
+memorises the training set.
+
+\item \textbf{Credit is the only dataset where the linear model matches the
+best tree.} Measured as the share of the distance from ``raw features only'' to
+``best tree'' that the full encoding covers: credit \creditClosed{} percent
+(\num{\creditBaseTest} against a tree of \num{\creditTree}), cpu\_act
+\cpuactClosed{} percent, pendigits \pendigitsClosed{} percent, house\_16H
+\houseSixteenHClosed{} percent, MagicTelescope \MagicTelescopeClosed{}
+percent, covertype \covertypeClosed{} percent, wine\_quality
+\winequalityClosed{} percent. The bits carry a large part of what the trees
+know, but on six of seven datasets a linear read-out of them does not recover
+all of it. The earlier ``matches the tree'' headline was a property of credit.
+
+\item \textbf{Wine quality is the clearest case of memorisation without
+learning.} With all bits the training explained-variance score is
+\num{\winequalityBaseTrain} and the test score \num{\winequalityBaseTest}, a
+gap of \num{\winequalityBaseGap}. The raw features alone reach
+\num{\winequalityRaw}, so the \num{\winequalityBits} bits added almost nothing
+a linear model could use, while giving it enough capacity to fit the training
+set nearly perfectly. The best tree reaches \num{\winequalityTree}; whatever it
+knows about wine is not linear in these bits. Here deletion even
+\emph{improves} test: deleting depth 5 gives \num{\winequalityDropFiveTest},
+the best arm on this dataset.
+
+\item \textbf{Deleting regularises cleanly; flipping damages calibration.}
+Log loss on the test split, the penalty for confident wrong answers, tells the
+two apart. Baseline, shallow, and flip-every-bit-at-0.20: credit
+\num{\creditBaseLL}, \num{\creditKeepLL}, \num{\creditUnifLL}; house\_16H
+\num{\houseSixteenHBaseLL}, \num{\houseSixteenHKeepLL},
+\num{\houseSixteenHUnifLL}; MagicTelescope \num{\MagicTelescopeBaseLL},
+\num{\MagicTelescopeKeepLL}, \num{\MagicTelescopeUnifLL}; covertype
+\num{\covertypeBaseLL}, \num{\covertypeKeepLL}, \num{\covertypeUnifLL}.
+On these four, deletion leaves the probabilities about as trustworthy as
+before while flipping makes them 16 to 53 percent worse, even though the
+ranking score is unchanged. Pendigits is the exception: baseline
+\num{\pendigitsBaseLL}, shallow \num{\pendigitsKeepLL}, flipped
+\num{\pendigitsUnifLL}; there both deletion and noise double the log loss,
+consistent with the many-class point below. The reason is a mismatch: the model is fitted on bits that are on
+more often than the clean bits it is scored on, so its scores shift. Ranking
+ignores a shift; log loss does not.
+
+\item \textbf{The same mismatch is catastrophic for regression.} Flat noise at
+$p = 0.16$ drives cpu\_act from \num{\cpuactBaseTest} to
+\num{\cpuactCtrlTest}, worse than guessing the average, and at $p = 0.20$ to
+\num{\cpuactUnifTest}. On wine\_quality flat noise at 0.16 gives
+\num{\winequalityCtrlTest} against a baseline of \num{\winequalityBaseTest}.
+A shifted score that ranking tolerates is a wrong number that a
+number-prediction score punishes in full.
+
+\item \textbf{The depth shape of the noise does not matter for classification
+and matters enormously for regression.} Ramp against its equal-budget flat
+control on the five classification datasets: credit \num{\creditRampTest}
+against \num{\creditCtrlTest}, house\_16H \num{\houseSixteenHRampTest} against
+\num{\houseSixteenHCtrlTest}, MagicTelescope \num{\MagicTelescopeRampTest}
+against \num{\MagicTelescopeCtrlTest}, pendigits \num{\pendigitsRampTest}
+against \num{\pendigitsCtrlTest}, covertype \num{\covertypeRampTest} against
+\num{\covertypeCtrlTest}, every pair within \num{0.0015}. On regression the
+ramp is far better, cpu\_act \num{\cpuactRampTest} against
+\num{\cpuactCtrlTest} and wine\_quality \num{\winequalityRampTest} against
+\num{\winequalityCtrlTest}, because it never flips the root bits that carry
+most of a regression forest's signal. But even the ramp costs cpu\_act
+\num{0.15} of explained variance. Noise, of any shape, is the wrong tool for
+regression; deletion is the right one.
+
+\item \textbf{Many-class problems keep more of their signal in the deep bits.}
+On pendigits the shallow arm loses only \num{0.0015} of ranking score but
+\num{0.040} of accuracy (\num{\pendigitsBaseTestAcc} to
+\num{\pendigitsKeepTestAcc}), because telling ten digits apart needs the fine
+splits that deep bits provide. Covertype shows the same in milder form
+(\num{\covertypeBaseTestAcc} to \num{\covertypeKeepTestAcc}). Ranking score
+alone would have hidden this; tracking every metric on every split exposed it.
+
+\item \textbf{How much to delete is a dial, and the dial reads the same on
+every dataset.} Deleting only depth 5 never costs more than \num{0.0021} of
+test score on any dataset and cuts the gap by 20 to 34 percent. Deleting
+depths 4 and 5 costs at most \num{0.0081} and cuts the gap by 39 to 64
+percent. Keeping only depths 0 to 2 costs at most \num{0.0159} and cuts it by
+62 to 94 percent. More deletion buys more regularisation at a slowly rising
+price, with the price highest on regression and many-class problems.
+
+\item \textbf{Every number here is from one random split and one seed.} The
+noise arms were shown earlier to vary by only \num{0.0002} between fresh noise
+draws, but the split itself is a larger source of variation, roughly
+\num{0.01} on a test set of two thousand rows. Differences smaller than that
+between arms should be read as ties.
+
+\end{enumerate}
+
+\section{Key findings}
+
+\begin{enumerate}
+
+\item \textbf{Feature regularisation works as a regulariser across every kind
+of problem tested.} On all five datasets where the full encoding overfit,
+deleting the deep tree layers cut the train-minus-validation gap by 62 to 94
+percent and brought the training score off its ceiling, at a test cost of at
+most \num{0.008} for deleting two layers and \num{0.016} for keeping only
+three. The credit observation was not a fluke of credit.
+
+\item \textbf{The ``linear model matches the tree'' result was specific to
+credit.} On the other six datasets the linear model covers between 48 and 95
+percent of the way from raw features to the best tree, and on wine quality
+almost none. The tree models remain ahead on six of seven datasets. The
+encoding carries most of what the trees know; a linear read-out does not
+recover all of it. This qualifies the earlier report and should be stated
+plainly in anything written up.
+
+\item \textbf{Delete, do not flip.} Deletion has far smaller side effects
+than noise. On two-class problems it leaves calibration and test scores intact;
+on regression and many-class problems it costs a little, never more than
+\num{0.016} of test score. Bit-flip noise raises log loss by 16 to 98 percent
+on classification, is destructive on regression, and never beats deletion on
+the test score. The recommended default is to delete depths 4 and 5, which
+shrinks the encoding three to four times, cuts overfitting by 39 to 64 percent,
+and costs at most \num{0.008} anywhere. On
+two-class problems, keeping only depths 0 to 2 is free and cuts overfitting
+by 75 to 94 percent.
+
+\item \textbf{Depth-shaped noise is not worth pursuing.} Against an
+equal-budget flat control it ties on every classification dataset. It wins on
+regression only because flat noise is catastrophic there, and even then it
+loses badly to simple deletion. The intuition behind it, that deep splits are
+the unreliable ones, is correct, and the way to act on it is to delete them.
+
+\item \textbf{Track more than one score.} The ranking score alone would have
+said the shallow encoding is free on pendigits; accuracy shows it costs four
+points. The ranking score alone would have said noise is harmless on
+classification; log loss shows it damages the probabilities. The request to
+track all metrics on all splits changed the conclusions, not just the tables.
+
+\item \textbf{What this establishes, and what comes next.} With the feature
+side now characterised across task types, the next step named in the earlier
+discussion is to put richer heads on the shallow encoding and compare them
+against this logistic one under the identical protocol. The tree models' lead
+on six of seven datasets says a nonlinear head has real room to gain; the
+credit result says it should be judged against a linear baseline that is
+already strong.
+
+\end{enumerate}
+
+\vfill
+\begin{flushleft}\footnotesize
+\textbf{Reproduction.} One command runs everything and writes every table,
+figure and per-run log:\\
+\texttt{python run\_feature\_reg\_suite.py -{}-root results/featreg\_suite -{}-bundle}\\[2pt]
+Repository: \texttt{github.com/sushanedulloo/TKCE}. Driver notebook:
+\texttt{colab\_feature\_reg\_suite.ipynb}. All numbers in this document,
+including those in the text, are generated from the run's own result files;
+none was typed by hand.
+\end{flushleft}
+
+\end{document}

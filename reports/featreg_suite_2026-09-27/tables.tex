@@ -1,0 +1,194 @@
+% ---- overview table (generated) ----
+\newcommand{\taboverview}{%
+\begin{tabular}{llrrrrrrrrrc}
+\toprule
+\textbf{Dataset} & \textbf{Kind} & \textbf{Best tree} & \textbf{Raw only} & \multicolumn{3}{c}{\textbf{All bits}} & \multicolumn{3}{c}{\textbf{Keep depths 0--2}} & \textbf{Test change} & \textbf{Holds}\\
+\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+ & & & & train & test & gap & train & test & gap & & \\
+\midrule
+credit & two-class & 0.8453 & 0.7288 & 0.9466 & 0.8457 & 0.0974 & 0.8737 & 0.8459 & 0.0241 & +0.0003 & yes\\
+house\_16H & two-class & 0.9526 & 0.8850 & 0.9941 & 0.9441 & 0.0471 & 0.9425 & 0.9369 & 0.0034 & -0.0071 & yes\\
+MagicTelescope & two-class & 0.9377 & 0.8486 & 0.9678 & 0.9047 & 0.0627 & 0.9041 & 0.8994 & 0.0037 & -0.0053 & yes\\
+pendigits & ten-class & 0.9995 & 0.9906 & 1.0000 & 0.9986 & 0.0015 & 0.9993 & 0.9971 & 0.0023 & -0.0015 & no\\
+covertype & seven-class & 0.9654 & 0.9106 & 0.9890 & 0.9370 & 0.0497 & 0.9505 & 0.9290 & 0.0191 & -0.0081 & yes\\
+cpu\_act & regression & 0.9867 & 0.7638 & 0.9912 & 0.9758 & 0.0092 & 0.9634 & 0.9599 & -0.0015 & -0.0159 & no\\
+wine\_quality & regression & 0.4722 & 0.2800 & 0.9199 & 0.2854 & 0.6045 & 0.4096 & 0.2793 & 0.1180 & -0.0061 & yes\\
+\bottomrule
+\end{tabular}}
+
+% ---- credit (generated) ----
+\newcommand{\tabcredit}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Ranking score}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Accuracy}} & \textbf{Log loss}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 10 & -- & 0.7466 & 0.7317 & 0.7288 & +0.0149 & 0.6674 & 0.6496 & 0.6310\\
+\midrule
+all bits, no change & 5401 & -- & 0.9466 & 0.8492 & 0.8457 & +0.0974 & 0.8721 & 0.7683 & 0.5086\\
+flip every bit, p = 0.20 & 5401 & 0.200 & 0.8840 & 0.8489 & 0.8460 & +0.0351 & 0.7562 & 0.7338 & 0.7787\\
+flips rising with depth, P = 0.2 & 5401 & 0.159 & 0.8914 & 0.8483 & 0.8446 & +0.0431 & 0.7911 & 0.7588 & 0.5861\\
+flip every bit, p = 0.16 (same budget as the ramp) & 5401 & 0.160 & 0.8899 & 0.8490 & 0.8461 & +0.0409 & 0.7722 & 0.7429 & 0.6733\\
+delete depth 5 & 2935 & -- & 0.9162 & 0.8497 & 0.8464 & +0.0665 & 0.8355 & 0.7675 & 0.4993\\
+delete depths 4 and 5 & 1480 & -- & 0.8899 & 0.8497 & 0.8460 & +0.0402 & 0.8096 & 0.7675 & 0.4955\\
+delete 4 and 5, then ramp 0.2 & 1480 & 0.025 & 0.8763 & 0.8491 & 0.8460 & +0.0271 & 0.7857 & 0.7650 & 0.5142\\
+\textbf{keep only depths 0, 1, 2} & 700 & -- & 0.8737 & 0.8496 & 0.8459 & +0.0241 & 0.7930 & 0.7650 & 0.4941\\
+\midrule
+best tree model (lightgbm) & & & & & 0.8453 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- house_16H (generated) ----
+\newcommand{\tabhouseSixteenH}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Ranking score}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Accuracy}} & \textbf{Log loss}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 16 & -- & 0.8856 & 0.8869 & 0.8850 & -0.0012 & 0.8156 & 0.8182 & 0.4578\\
+\midrule
+all bits, no change & 5756 & -- & 0.9941 & 0.9471 & 0.9441 & +0.0471 & 0.9619 & 0.8765 & 0.3170\\
+flip every bit, p = 0.20 & 5756 & 0.200 & 0.9611 & 0.9462 & 0.9437 & +0.0149 & 0.8811 & 0.8651 & 0.4234\\
+flips rising with depth, P = 0.2 & 5756 & 0.161 & 0.9671 & 0.9465 & 0.9437 & +0.0206 & 0.8941 & 0.8671 & 0.3623\\
+flip every bit, p = 0.16 (same budget as the ramp) & 5756 & 0.160 & 0.9659 & 0.9467 & 0.9440 & +0.0192 & 0.8925 & 0.8681 & 0.3835\\
+delete depth 5 & 3032 & -- & 0.9808 & 0.9463 & 0.9439 & +0.0345 & 0.9323 & 0.8755 & 0.3082\\
+delete depths 4 and 5 & 1497 & -- & 0.9625 & 0.9440 & 0.9415 & +0.0184 & 0.8995 & 0.8701 & 0.3090\\
+delete 4 and 5, then ramp 0.2 & 1497 & 0.024 & 0.9517 & 0.9431 & 0.9400 & +0.0086 & 0.8816 & 0.8715 & 0.3203\\
+\textbf{keep only depths 0, 1, 2} & 700 & -- & 0.9425 & 0.9392 & 0.9369 & +0.0034 & 0.8733 & 0.8651 & 0.3205\\
+\midrule
+best tree model (lightgbm) & & & & & 0.9526 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- MagicTelescope (generated) ----
+\newcommand{\tabMagicTelescope}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Ranking score}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Accuracy}} & \textbf{Log loss}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 10 & -- & 0.8418 & 0.8376 & 0.8486 & +0.0042 & 0.7724 & 0.7698 & 0.4835\\
+\midrule
+all bits, no change & 4684 & -- & 0.9678 & 0.9051 & 0.9047 & +0.0627 & 0.9096 & 0.8251 & 0.3935\\
+flip every bit, p = 0.20 & 4684 & 0.200 & 0.9184 & 0.9033 & 0.9029 & +0.0151 & 0.8343 & 0.8186 & 0.5237\\
+flips rising with depth, P = 0.2 & 4684 & 0.155 & 0.9247 & 0.9049 & 0.9032 & +0.0198 & 0.8470 & 0.8216 & 0.4411\\
+flip every bit, p = 0.16 (same budget as the ramp) & 4684 & 0.160 & 0.9240 & 0.9045 & 0.9040 & +0.0196 & 0.8455 & 0.8246 & 0.4747\\
+delete depth 5 & 2752 & -- & 0.9470 & 0.9054 & 0.9050 & +0.0417 & 0.8787 & 0.8296 & 0.3892\\
+delete depths 4 and 5 & 1454 & -- & 0.9257 & 0.9033 & 0.9030 & +0.0224 & 0.8514 & 0.8271 & 0.3925\\
+delete 4 and 5, then ramp 0.2 & 1454 & 0.028 & 0.9110 & 0.9014 & 0.9004 & +0.0096 & 0.8323 & 0.8236 & 0.4042\\
+\textbf{keep only depths 0, 1, 2} & 698 & -- & 0.9041 & 0.9005 & 0.8994 & +0.0037 & 0.8227 & 0.8281 & 0.4010\\
+\midrule
+best tree model (xgboost) & & & & & 0.9377 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- pendigits (generated) ----
+\newcommand{\tabpendigits}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Ranking score}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Accuracy}} & \textbf{Log loss}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 16 & -- & 0.9911 & 0.9911 & 0.9906 & -0.0001 & 0.8980 & 0.9005 & 0.4524\\
+\midrule
+all bits, no change & 5517 & -- & 1.0000 & 0.9985 & 0.9986 & +0.0015 & 1.0000 & 0.9703 & 0.1093\\
+flip every bit, p = 0.20 & 5517 & 0.200 & 0.9996 & 0.9973 & 0.9974 & +0.0023 & 0.9645 & 0.9375 & 0.2168\\
+flips rising with depth, P = 0.2 & 5517 & 0.159 & 0.9999 & 0.9978 & 0.9979 & +0.0021 & 0.9818 & 0.9478 & 0.1628\\
+flip every bit, p = 0.16 (same budget as the ramp) & 5517 & 0.160 & 0.9999 & 0.9977 & 0.9978 & +0.0021 & 0.9783 & 0.9460 & 0.1745\\
+delete depth 5 & 3024 & -- & 1.0000 & 0.9984 & 0.9985 & +0.0016 & 1.0000 & 0.9648 & 0.1211\\
+delete depths 4 and 5 & 1498 & -- & 1.0000 & 0.9980 & 0.9983 & +0.0020 & 0.9960 & 0.9557 & 0.1493\\
+delete 4 and 5, then ramp 0.2 & 1498 & 0.025 & 0.9997 & 0.9974 & 0.9977 & +0.0023 & 0.9727 & 0.9466 & 0.1715\\
+\textbf{keep only depths 0, 1, 2} & 700 & -- & 0.9993 & 0.9969 & 0.9971 & +0.0023 & 0.9696 & 0.9303 & 0.2202\\
+\midrule
+best tree model (lightgbm) & & & & & 0.9995 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- covertype (generated) ----
+\newcommand{\tabcovertype}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Ranking score}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Accuracy}} & \textbf{Log loss}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 54 & -- & 0.9238 & 0.9188 & 0.9106 & +0.0050 & 0.6970 & 0.6979 & 0.7367\\
+\midrule
+all bits, no change & 4339 & -- & 0.9890 & 0.9394 & 0.9370 & +0.0497 & 0.8956 & 0.7233 & 0.6434\\
+flip every bit, p = 0.20 & 4339 & 0.200 & 0.9619 & 0.9352 & 0.9332 & +0.0267 & 0.7696 & 0.7163 & 0.7488\\
+flips rising with depth, P = 0.2 & 4339 & 0.154 & 0.9675 & 0.9369 & 0.9345 & +0.0306 & 0.7871 & 0.7196 & 0.6931\\
+flip every bit, p = 0.16 (same budget as the ramp) & 4339 & 0.160 & 0.9662 & 0.9364 & 0.9339 & +0.0298 & 0.7804 & 0.7179 & 0.7116\\
+delete depth 5 & 2554 & -- & 0.9797 & 0.9399 & 0.9368 & +0.0398 & 0.8435 & 0.7233 & 0.6331\\
+delete depths 4 and 5 & 1394 & -- & 0.9670 & 0.9367 & 0.9354 & +0.0303 & 0.7925 & 0.7238 & 0.6350\\
+delete 4 and 5, then ramp 0.2 & 1394 & 0.029 & 0.9561 & 0.9337 & 0.9329 & +0.0223 & 0.7578 & 0.7179 & 0.6512\\
+\textbf{keep only depths 0, 1, 2} & 689 & -- & 0.9505 & 0.9314 & 0.9290 & +0.0191 & 0.7438 & 0.7179 & 0.6644\\
+\midrule
+best tree model (xgboost) & & & & & 0.9654 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- cpu_act (generated) ----
+\newcommand{\tabcpuact}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Explained variance}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Typical error}} & \textbf{Avg.\ abs.\ error}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 21 & -- & 0.7247 & 0.7070 & 0.7638 & +0.0177 & 9.540 & 8.974 & 5.695\\
+\midrule
+all bits, no change & 3507 & -- & 0.9912 & 0.9820 & 0.9758 & +0.0092 & 1.707 & 2.874 & 1.956\\
+flip every bit, p = 0.20 & 3507 & 0.200 & -2.0525 & -1.6278 & -1.9647 & -0.4247 & 31.765 & 31.794 & 30.880\\
+flips rising with depth, P = 0.2 & 3507 & 0.153 & 0.8285 & 0.8456 & 0.8253 & -0.0171 & 7.529 & 7.718 & 6.828\\
+flip every bit, p = 0.16 (same budget as the ramp) & 3507 & 0.160 & -0.7566 & -0.5114 & -0.7046 & -0.2453 & 24.097 & 24.109 & 23.398\\
+delete depth 5 & 1939 & -- & 0.9849 & 0.9805 & 0.9737 & +0.0043 & 2.236 & 2.997 & 2.039\\
+delete depths 4 and 5 & 1116 & -- & 0.9770 & 0.9755 & 0.9677 & +0.0015 & 2.757 & 3.318 & 2.296\\
+delete 4 and 5, then ramp 0.2 & 1116 & 0.026 & 0.9433 & 0.9472 & 0.9393 & -0.0040 & 4.331 & 4.549 & 3.461\\
+\textbf{keep only depths 0, 1, 2} & 629 & -- & 0.9634 & 0.9648 & 0.9599 & -0.0015 & 3.480 & 3.700 & 2.632\\
+\midrule
+best tree model (lightgbm) & & & & & 0.9867 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- wine_quality (generated) ----
+\newcommand{\tabwinequality}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+\textbf{Arm} & \textbf{Bits} & \textbf{Flip} & \multicolumn{3}{c}{\textbf{Explained variance}} & \textbf{Gap} & \multicolumn{2}{c}{\textbf{Typical error}} & \textbf{Avg.\ abs.\ error}\\
+\cmidrule(lr){4-6}\cmidrule(lr){8-9}
+ & & rate & train & val & test & & train & test & test\\
+\midrule
+raw features only (no tree bits) & 11 & -- & 0.2936 & 0.2945 & 0.2800 & -0.0008 & 0.731 & 0.748 & 0.586\\
+\midrule
+all bits, no change & 5498 & -- & 0.9199 & 0.3153 & 0.2854 & +0.6045 & 0.246 & 0.745 & 0.585\\
+flip every bit, p = 0.20 & 5498 & 0.200 & 0.3219 & 0.2030 & 0.1518 & +0.1190 & 0.716 & 0.812 & 0.640\\
+flips rising with depth, P = 0.2 & 5498 & 0.159 & 0.4797 & 0.2992 & 0.2577 & +0.1805 & 0.628 & 0.760 & 0.595\\
+flip every bit, p = 0.16 (same budget as the ramp) & 5498 & 0.160 & 0.4374 & 0.2642 & 0.2267 & +0.1732 & 0.653 & 0.775 & 0.607\\
+delete depth 5 & 2993 & -- & 0.7358 & 0.3055 & 0.3075 & +0.4303 & 0.447 & 0.734 & 0.575\\
+delete depths 4 and 5 & 1493 & -- & 0.5443 & 0.3169 & 0.3071 & +0.2274 & 0.587 & 0.734 & 0.570\\
+delete 4 and 5, then ramp 0.2 & 1493 & 0.025 & 0.4370 & 0.3116 & 0.2890 & +0.1254 & 0.653 & 0.744 & 0.577\\
+\textbf{keep only depths 0, 1, 2} & 700 & -- & 0.4096 & 0.2916 & 0.2793 & +0.1180 & 0.668 & 0.749 & 0.585\\
+\midrule
+best tree model (random forest) & & & & & 0.4722 & & & & \\
+\bottomrule
+\end{tabular}}
+
+% ---- sizes (generated) ----
+\newcommand{\tabsizes}{%
+\begin{tabular}{llrrrrrr}
+\toprule
+\textbf{Dataset} & \textbf{Kind} & \textbf{Raw features} & \textbf{Train} & \textbf{Val} & \textbf{Test} & \textbf{Tree bits} & \textbf{Best tree}\\
+\midrule
+credit & two-class & 10 & 11,200 & 2,400 & 2,400 & 5,401 & lightgbm 0.8453\\
+house\_16H & two-class & 16 & 9,441 & 2,023 & 2,024 & 5,756 & lightgbm 0.9526\\
+MagicTelescope & two-class & 10 & 9,363 & 2,006 & 2,007 & 4,684 & xgboost 0.9377\\
+pendigits & ten-class & 16 & 7,694 & 1,649 & 1,649 & 5,517 & lightgbm 0.9995\\
+covertype & seven-class & 54 & 11,200 & 2,400 & 2,400 & 4,339 & xgboost 0.9654\\
+cpu\_act & regression & 21 & 5,734 & 1,229 & 1,229 & 3,507 & lightgbm 0.9867\\
+wine\_quality & regression & 11 & 4,547 & 975 & 975 & 5,498 & random forest 0.4722\\
+\bottomrule
+\end{tabular}}
