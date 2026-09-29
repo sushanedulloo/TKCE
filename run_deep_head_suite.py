@@ -45,7 +45,15 @@ TASK = 361065          # MagicTelescope
 SHALLOW = "--drop-layers 4,5"
 FULL = ""
 
-HEADS = ["mlp", "tabresnet", "treetf"]
+HEADS = ["mlp", "tabresnet", "bittf"]
+
+# Attention over bit tokens is quadratic in the number of bits, so the
+# transformer gets a smaller batch (its activations are the (batch, bits,
+# width) tokens) and, on the full encoding, fewer epochs and fewer arms. The
+# other heads are cheap and keep the full grid.
+BATCH = {"bittf": 64}
+FULL_EPOCHS = {"bittf": 60}
+FULL_SIZES = {"bittf": ["small", "medium"]}
 SIZES = ["small", "medium", "large"]
 # (label, dropout, weight decay) -- a clean 2x2 so each cell is interpretable
 REG = [("none",    0.0, 1e-5),
@@ -72,7 +80,7 @@ def plan(part):
                  for h in HEADS for s in SIZES for r in REG]
     if part in ("C", "all"):
         jobs += [("full", FULL, h, s, r)
-                 for h in HEADS for s in SIZES for r in REG_FULL]
+                 for h in HEADS for s in FULL_SIZES.get(h, SIZES) for r in REG_FULL]
     return jobs
 
 
@@ -92,6 +100,10 @@ def run_all(root, jobs, quick, ckpt_dir, cache_dir, sync_dir=None):
             cmd += flags.split()
         if head != "linear":
             cmd += ["--size", size, "--dropout", str(do), "--weight-decay", str(wd)]
+            if head in BATCH:
+                cmd += ["--batch-size", str(BATCH[head])]
+            if bits == "full" and head in FULL_EPOCHS:
+                cmd += ["--epochs", str(FULL_EPOCHS[head])]
             if ckpt_dir:
                 cmd += ["--ckpt-dir", ckpt_dir, "--ckpt-every", "10"]
         if cache_dir:
@@ -160,7 +172,7 @@ def figures(t, root):
     CEIL = t.tree_ceiling.iloc[0]
     lin = t[(t["head"] == "linear") & (t.bits == "shallow")]
     LIN = float(lin.test.iloc[0]) if len(lin) else np.nan
-    HCOL = {"mlp": BLUE, "tabresnet": ORANGE, "treetf": AQUA}
+    HCOL = {"mlp": BLUE, "tabresnet": ORANGE, "bittf": AQUA, "treetf": VIOLET}
 
     # --- 1: test score by head, size and regularisation (shallow bits) ---
     sh = t[(t.bits == "shallow") & (t["head"] != "linear")]
@@ -285,9 +297,15 @@ Heads
   linear      logistic regression, penalty chosen on validation. The reference.
   mlp         a plain multi-layer network on the bits
   tabresnet   the residual network used earlier in this project
-  treetf      a transformer whose tokens are TREES: each tree's bits are
-              bundled into one token, so attention runs over 100 tokens and
-              learns how trees relate, instead of over thousands of bits
+  bittf       a transformer in which EVERY BIT is its own token, so every
+              split attends to every other split. Each bit gets its own learned
+              embedding, so the model learns what each individual split means
+              and which splits matter together. This is the expensive option:
+              attention cost grows with the square of the bit count, and the
+              ordinary implementation would need about 17 GB for the shallow
+              encoding at batch 256. It is made to fit with PyTorch's
+              memory-efficient attention kernel, which never builds the full
+              score matrix, plus a smaller batch (64) and mixed precision.
 
 Sizes: small, medium, large (see the parameter counts in the tables).
 Regularisation: none / dropout 0.3 / weight decay 0.01 / both.

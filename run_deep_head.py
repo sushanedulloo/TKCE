@@ -73,7 +73,73 @@ warnings.filterwarnings("ignore", message=".*enable_nested_tensor.*")
 
 
 # --------------------------------------------------------------------------- #
-# the transformer over TREE tokens
+# the transformer over BIT tokens -- every bit attends to every other bit
+# --------------------------------------------------------------------------- #
+class _AttnBlock(nn.Module):
+    """One pre-norm transformer block using PyTorch's memory-efficient attention.
+
+    Written by hand rather than with nn.TransformerEncoderLayer so the call to
+    scaled_dot_product_attention is explicit. That matters here: the ordinary
+    attention implementation materialises a (batch, heads, n, n) score matrix,
+    which for 1,455 bit tokens at batch 256 is about 17 GB and will not fit on
+    a T4. The fused kernel never builds that matrix, so memory grows linearly
+    in the number of tokens instead of quadratically, and only the arithmetic
+    stays quadratic.
+    """
+
+    def __init__(self, d, n_heads, dropout):
+        super().__init__()
+        self.h, self.dh, self.p = n_heads, d // n_heads, dropout
+        self.n1 = nn.LayerNorm(d)
+        self.qkv = nn.Linear(d, 3 * d)
+        self.proj = nn.Linear(d, d)
+        self.n2 = nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(),
+                                nn.Dropout(dropout), nn.Linear(2 * d, d))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):                                   # (B, N, D)
+        B, N, D = x.shape
+        q, k, v = (self.qkv(self.n1(x))
+                   .view(B, N, 3, self.h, self.dh).permute(2, 0, 3, 1, 4))
+        a = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.p if self.training else 0.0)
+        x = x + self.drop(self.proj(a.transpose(1, 2).reshape(B, N, D)))
+        return x + self.ff(self.n2(x))
+
+
+class BitTokenTransformer(nn.Module):
+    """Every bit is its own token; attention runs over all of them.
+
+    Each bit j gets its own learned embedding direction, so token_j is
+    value_j * w_j + b_j. That is the feature-tokenizer idea: a bit that is on
+    contributes w_j + b_j, a bit that is off contributes b_j, and the model
+    learns what each individual split means. A classification token is
+    prepended and its output feeds the prediction.
+    """
+
+    def __init__(self, n_bits, out_dim, d_token=64, n_blocks=3, n_heads=8,
+                 dropout=0.1):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(n_bits, d_token) * 0.02)
+        self.b = nn.Parameter(torch.zeros(n_bits, d_token))
+        self.cls = nn.Parameter(torch.randn(1, 1, d_token) * 0.02)
+        self.blocks = nn.ModuleList(
+            [_AttnBlock(d_token, n_heads, dropout) for _ in range(n_blocks)])
+        self.norm = nn.LayerNorm(d_token)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Linear(d_token, out_dim)
+
+    def forward(self, x):                                   # (B, n_bits)
+        tok = x.unsqueeze(-1) * self.w + self.b             # (B, n_bits, d)
+        tok = torch.cat([self.cls.expand(x.shape[0], -1, -1), tok], dim=1)
+        for blk in self.blocks:
+            tok = blk(tok)
+        return self.head(self.drop(self.norm(tok[:, 0])))
+
+
+# --------------------------------------------------------------------------- #
+# the transformer over TREE tokens (kept as a cheaper comparison arm)
 # --------------------------------------------------------------------------- #
 def tree_token_index(rf, kept):
     """Map the surviving bits onto a (n_trees, max_bits_per_tree) index grid.
@@ -137,6 +203,11 @@ SIZES = {
     "treetf":    {"small": dict(d_token=32, n_blocks=2, n_heads=4),
                   "medium": dict(d_token=64, n_blocks=3, n_heads=8),
                   "large": dict(d_token=128, n_blocks=4, n_heads=8)},
+    # Bit tokens are far more numerous, so these stay deliberately narrow and
+    # shallow; the cost is driven by the token count, not by the width.
+    "bittf":     {"small": dict(d_token=32, n_blocks=1, n_heads=4),
+                  "medium": dict(d_token=48, n_blocks=2, n_heads=6),
+                  "large": dict(d_token=64, n_blocks=3, n_heads=8)},
 }
 
 
@@ -149,6 +220,9 @@ def build_model(head, size, n_bits, n_classes, dropout, idx=None, mask=None):
     if head == "treetf":
         return TreeTokenTransformer(idx, mask, n_classes, dropout=dropout,
                                     **SIZES["treetf"][size])
+    if head == "bittf":
+        return BitTokenTransformer(n_bits, n_classes, dropout=dropout,
+                                   **SIZES["bittf"][size])
     raise ValueError(head)
 
 
@@ -242,7 +316,7 @@ def main():
     ap.add_argument("--keep-layers", type=str, default=None)
     # the head
     ap.add_argument("--head", default="linear",
-                    choices=["linear", "mlp", "tabresnet", "treetf"])
+                    choices=["linear", "mlp", "tabresnet", "bittf", "treetf"])
     ap.add_argument("--size", default="medium", choices=["small", "medium", "large"])
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--weight-decay", type=float, default=1e-5)
@@ -255,6 +329,13 @@ def main():
                     default=[1e-4, 3e-4, 1e-3, 3e-3, 0.01, 0.03, 0.1, 0.3, 1.0],
                     help="penalties swept for the linear reference; best on validation")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--amp", default="auto", choices=["auto", "on", "off"],
+                    help="mixed precision. Attention over bit tokens is "
+                         "compute-bound and a T4's tensor cores only engage in "
+                         "half precision, so this is on by default on a GPU")
+    ap.add_argument("--time-probe", type=int, default=0,
+                    help="train this many epochs, report seconds per epoch and "
+                         "the projected full-run time, then stop")
     # resuming
     ap.add_argument("--cache-dir", default=None,
                     help="where the forest, bits and tree baselines are cached "
@@ -338,6 +419,10 @@ def main():
               f"dropout {args.dropout} | weight decay {args.weight_decay}", flush=True)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                 weight_decay=args.weight_decay)
+        use_amp = (args.amp == "on") or (args.amp == "auto" and device.type == "cuda")
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        if use_amp:
+            print("[head] mixed precision on", flush=True)
         loader = DataLoader(TensorDataset(torch.from_numpy(Xtr),
                                           torch.from_numpy(ds.y_train)),
                             batch_size=args.batch_size, shuffle=True, drop_last=False)
@@ -361,10 +446,20 @@ def main():
             tot = 0.0
             for xb, yb in loader:
                 xb, yb = xb.to(device), yb.to(device)
-                opt.zero_grad()
-                loss = F.cross_entropy(model(xb), yb)
-                loss.backward(); opt.step()
+                opt.zero_grad(set_to_none=True)
+                with torch.autocast("cuda", enabled=use_amp):
+                    loss = F.cross_entropy(model(xb), yb)
+                scaler.scale(loss).backward()
+                scaler.step(opt); scaler.update()
                 tot += float(loss) * len(xb)
+            if args.time_probe and ep == args.time_probe:
+                per = (time.time() - t0) / args.time_probe
+                print(f"\n[probe] {per:.1f} s per epoch at batch {args.batch_size} "
+                      f"on {n_bits} bits", flush=True)
+                print(f"[probe] a {args.epochs}-epoch run would take about "
+                      f"{per * args.epochs / 60:.0f} min "
+                      f"(less if it stops early)", flush=True)
+                return
             m = {s: metrics(y, predict(model, X, device)) for s, X, y in
                  [("train", Xtr, ds.y_train), ("val", Xva, ds.y_val)]}
             hist.append(dict(epoch=ep, train_loss=tot / len(Xtr),
