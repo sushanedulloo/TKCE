@@ -195,11 +195,35 @@ class TreeTokenTransformer(nn.Module):
         return self.head(self.drop(self.norm(z[:, 0])))
 
 
+class InputDropout(nn.Module):
+    """Drop whole input BITS during training, before the head sees them.
+
+    The heads' own dropout only acts on hidden activations, but on this data
+    almost all of the capacity, and therefore almost all of the memorising,
+    sits in the very first layer: one weight per bit per unit. Dropping bits at
+    the input is the in-network analogue of the bit-flip noise that worked on
+    the feature side, and it is the only setting that touches that first layer.
+    Scaling by 1/(1-p) at training time keeps the expected input unchanged, so
+    evaluation needs no correction.
+    """
+
+    def __init__(self, head, p):
+        super().__init__()
+        self.head, self.drop = head, nn.Dropout(p)
+
+    def forward(self, x):
+        return self.head(self.drop(x))
+
+
 SIZES = {
-    "mlp":       {"small": (128, 64), "medium": (512, 256), "large": (1024, 512, 256)},
-    "tabresnet": {"small": dict(d=64, d_hidden=128, n_blocks=2),
-                  "medium": dict(d=192, d_hidden=384, n_blocks=3),
-                  "large": dict(d=384, d_hidden=768, n_blocks=4)},
+    # The first layer is (n_bits x width), so on 1,454 bits it holds 70-96% of
+    # every model's parameters. Widths are therefore chosen to make the size
+    # knob move THAT number: on 1,454 bits these give 47k / 186k / 745k in the
+    # first layer, a 16-fold range, instead of the old 186k-1.5M eightfold.
+    "mlp":       {"small": (32, 32), "medium": (128, 64), "large": (512, 256)},
+    "tabresnet": {"small": dict(d=32, d_hidden=64, n_blocks=2),
+                  "medium": dict(d=96, d_hidden=192, n_blocks=3),
+                  "large": dict(d=256, d_hidden=512, n_blocks=4)},
     "treetf":    {"small": dict(d_token=32, n_blocks=2, n_heads=4),
                   "medium": dict(d_token=64, n_blocks=3, n_heads=8),
                   "large": dict(d_token=128, n_blocks=4, n_heads=8)},
@@ -319,7 +343,17 @@ def main():
                     choices=["linear", "mlp", "tabresnet", "bittf", "treetf"])
     ap.add_argument("--size", default="medium", choices=["small", "medium", "large"])
     ap.add_argument("--dropout", type=float, default=0.0)
-    ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--weight-decay", type=float, default=1e-5,
+                    help="AdamW decoupled decay. NOTE 0.01 is almost a no-op here: "
+                         "at lr 1e-3 over ~1,500 steps it shrinks the weights by "
+                         "1.5%%. Meaningful values on this problem are 0.1 to 1.0")
+    ap.add_argument("--input-dropout", type=float, default=0.0,
+                    help="drop whole input bits during training; the in-network "
+                         "analogue of bit-flip noise, and the only setting that "
+                         "reaches the first layer where the memorising happens")
+    ap.add_argument("--label-smoothing", type=float, default=0.0,
+                    help="softens the targets; helps the log loss, which is the "
+                         "metric that suffers most when a head memorises")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=200)
@@ -413,10 +447,16 @@ def main():
                 idx, msk = tree_token_index(rf, kept)
             print(f"[head] {idx.shape[0]} tree tokens, up to {idx.shape[1]} bits each",
                   flush=True)
-        model = build_model(args.head, args.size, n_bits, 2, args.dropout, idx, msk).to(device)
+        model = build_model(args.head, args.size, n_bits, 2, args.dropout, idx, msk)
+        if args.input_dropout > 0:
+            model = InputDropout(model, args.input_dropout)
+        model = model.to(device)
         n_par = sum(p.numel() for p in model.parameters())
         print(f"[head] {args.head} {args.size}: {n_par:,} parameters | "
-              f"dropout {args.dropout} | weight decay {args.weight_decay}", flush=True)
+              f"hidden dropout {args.dropout} | input dropout {args.input_dropout} | "
+              f"weight decay {args.weight_decay}"
+              + (f" | label smoothing {args.label_smoothing}"
+                 if args.label_smoothing else ""), flush=True)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                 weight_decay=args.weight_decay)
         use_amp = (args.amp == "on") or (args.amp == "auto" and device.type == "cuda")
@@ -448,10 +488,11 @@ def main():
                 xb, yb = xb.to(device), yb.to(device)
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", enabled=use_amp):
-                    loss = F.cross_entropy(model(xb), yb)
+                    loss = F.cross_entropy(model(xb), yb,
+                                           label_smoothing=args.label_smoothing)
                 scaler.scale(loss).backward()
                 scaler.step(opt); scaler.update()
-                tot += float(loss) * len(xb)
+                tot += float(loss.detach()) * len(xb)
             if args.time_probe and ep == args.time_probe:
                 per = (time.time() - t0) / args.time_probe
                 print(f"\n[probe] {per:.1f} s per epoch at batch {args.batch_size} "
@@ -506,7 +547,9 @@ def main():
 
     summary = dict(dataset=ds.name, task=args.task, label=label, head=args.head,
                    size=args.size if args.head != "linear" else "-",
-                   dropout=args.dropout, weight_decay=args.weight_decay, lr=args.lr,
+                   dropout=args.dropout, input_dropout=args.input_dropout,
+                   label_smoothing=args.label_smoothing,
+                   weight_decay=args.weight_decay, lr=args.lr,
                    batch_size=args.batch_size, epochs=args.epochs,
                    patience=args.patience, seed=args.seed, encoding=args.encoding,
                    bits_selection=what, n_bits=n_bits, n_bits_all=int(n_bits_all),

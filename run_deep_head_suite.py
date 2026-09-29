@@ -55,12 +55,25 @@ BATCH = {"bittf": 64}
 FULL_EPOCHS = {"bittf": 60}
 FULL_SIZES = {"bittf": ["small", "medium"]}
 SIZES = ["small", "medium", "large"]
-# (label, dropout, weight decay) -- a clean 2x2 so each cell is interpretable
-REG = [("none",    0.0, 1e-5),
-       ("dropout", 0.3, 1e-5),
-       ("decay",   0.0, 1e-2),
-       ("both",    0.3, 1e-2)]
-REG_FULL = [r for r in REG if r[0] in ("none", "both")]
+# (label, hidden dropout, weight decay, INPUT dropout)
+#
+# The first grid was too weak to test anything. AdamW decay of 0.01 at lr 1e-3
+# shrinks the weights by 1.5% over a whole run, so the "decay" arm moved the
+# overfitting gap by 0.0002 -- it was a no-op dressed as a condition. And the
+# heads' dropout only touches hidden activations, while 85-97% of the
+# parameters, and so nearly all of the memorising, sit in the first layer.
+#
+# This grid fixes both: decay values that actually bind, and input dropout,
+# which drops whole bits and is the only setting that reaches that first layer.
+# It is the in-network analogue of the bit-flip noise that worked on the
+# feature side.
+REG = [("none",     0.0, 1e-5, 0.0),
+       ("hidden",   0.3, 1e-5, 0.0),   # what the old grid called "dropout"
+       ("decay",    0.0, 0.3,  0.0),   # decay that actually binds (36% shrinkage)
+       ("input",    0.0, 1e-5, 0.3),   # the new lever, on its own
+       ("input5",   0.0, 1e-5, 0.5),   # and harder
+       ("all",      0.3, 0.3,  0.3)]   # everything together
+REG_FULL = [r for r in REG if r[0] in ("none", "all")]
 
 SHARED = ("--task 361065 --seed 0 --max-rows 16000 --rf-trees 100 --rf-depth 6 "
           "--rf-min-leaf 5 --encoding oob --lr 1e-3 --batch-size 256 "
@@ -73,8 +86,8 @@ def plan(part):
     """Every run in the grid: (bits label, extra bit flags, head, size, reg)."""
     jobs = []
     if part in ("A", "all"):
-        jobs += [("shallow", SHALLOW, "linear", "-", ("-", 0.0, 0.0)),
-                 ("full", FULL, "linear", "-", ("-", 0.0, 0.0))]
+        jobs += [("shallow", SHALLOW, "linear", "-", ("-", 0.0, 0.0, 0.0)),
+                 ("full", FULL, "linear", "-", ("-", 0.0, 0.0, 0.0))]
     if part in ("B", "all"):
         jobs += [("shallow", SHALLOW, h, s, r)
                  for h in HEADS for s in SIZES for r in REG]
@@ -87,19 +100,37 @@ def plan(part):
 def run_all(root, jobs, quick, ckpt_dir, cache_dir, sync_dir=None):
     print(f"[suite] {len(jobs)} runs -> {root}", flush=True)
     t_all = time.time()
-    for i, (bits, flags, head, size, (rlab, do, wd)) in enumerate(jobs, 1):
+    for i, (bits, flags, head, size, (rlab, do, wd, idr)) in enumerate(jobs, 1):
         label = (f"{head}" if head == "linear" else f"{head}_{size}_{rlab}")
         out = os.path.join(root, bits, label)
-        if glob.glob(os.path.join(out, "deephead_*.json")):
-            print(f"[suite] {i:3d}/{len(jobs)} {bits:8s} {label:24s} done, skipping",
-                  flush=True)
-            continue
+        done = glob.glob(os.path.join(out, "deephead_*.json"))
+        if done:
+            # Skip only if the finished run used the settings this grid asks for
+            # now. Sizes and regularisation values have been revised once
+            # already, and a label like "decay" meant weight decay 0.01 before
+            # and 0.3 now; skipping on the name alone would silently mix the two.
+            try:
+                prev = json.load(open(done[0]))
+                stale = [f"{k}: {prev.get(k)} -> {v}" for k, v in
+                         [("size", size if head != "linear" else "-"),
+                          ("dropout", do), ("weight_decay", wd),
+                          ("input_dropout", idr)]
+                         if head != "linear" and prev.get(k) != v]
+            except Exception:  # noqa: BLE001 - unreadable file, just rerun it
+                stale = ["unreadable"]
+            if not stale:
+                print(f"[suite] {i:3d}/{len(jobs)} {bits:8s} {label:24s} done, skipping",
+                      flush=True)
+                continue
+            print(f"[suite] {i:3d}/{len(jobs)} {bits:8s} {label:24s} RERUN, settings "
+                  f"changed ({'; '.join(stale)})", flush=True)
         cmd = [PY, "-u", "run_deep_head.py", "--head", head, "--label", label,
                "--out", out] + SHARED.split()
         if flags:
             cmd += flags.split()
         if head != "linear":
-            cmd += ["--size", size, "--dropout", str(do), "--weight-decay", str(wd)]
+            cmd += ["--size", size, "--dropout", str(do), "--weight-decay", str(wd),
+                    "--input-dropout", str(idr)]
             if head in BATCH:
                 cmd += ["--batch-size", str(BATCH[head])]
             if bits == "full" and head in FULL_EPOCHS:
@@ -185,11 +216,12 @@ def figures(t, root):
             for h in HEADS:
                 for s in SIZES:
                     g = sh[(sh["head"] == h) & (sh["size"] == s)]
-                    for j, (rl, _, _) in enumerate(REG):
+                    for j, (rl, *_rest) in enumerate(REG):
                         v = g[g.reg == rl]
                         if len(v):
                             a_.scatter([x], [float(v[col].iloc[0])], s=46,
-                                       color=HCOL[h], alpha=[.35, .6, .8, 1.0][j],
+                                       color=HCOL[h],
+                                       alpha=0.3 + 0.7 * j / max(1, len(REG) - 1),
                                        edgecolor="white", lw=.8, zorder=3)
                     ticks.append(x); labels.append(f"{h}\n{s}")
                     x += 1
@@ -307,8 +339,19 @@ Heads
               memory-efficient attention kernel, which never builds the full
               score matrix, plus a smaller batch (64) and mixed precision.
 
-Sizes: small, medium, large (see the parameter counts in the tables).
-Regularisation: none / dropout 0.3 / weight decay 0.01 / both.
+Sizes: small, medium, large. These are chosen so the knob moves the FIRST
+layer, which on 1,454 bits holds 85-97% of every model's parameters and is
+where the memorising happens.
+
+Regularisation, six settings:
+  none     nothing
+  hidden   dropout 0.3 on the hidden activations only
+  decay    AdamW weight decay 0.3 (0.01 was a no-op: 1.5% shrinkage per run)
+  input    input dropout 0.3 -- drops whole BITS before the head sees them
+  input5   input dropout 0.5
+  all      hidden 0.3 + decay 0.3 + input 0.3
+Input dropout is the in-network analogue of the bit-flip noise that worked on
+the feature side, and the only setting that reaches the first layer.
 
 Encodings
   shallow   depths 4 and 5 deleted, about 1,450 bits -- the recommended
