@@ -234,8 +234,9 @@ def figures(t, root):
             a_.set_xticks(ticks); a_.set_xticklabels(labels, fontsize=7.5)
             a_.set_title(ttl, fontweight="bold", loc="left", fontsize=10)
             a_.legend(fontsize=8)
-        ax[0].scatter([], [], s=46, color=MUTED, alpha=.35, label="no regularisation")
-        ax[0].scatter([], [], s=46, color=MUTED, alpha=1.0, label="dropout + weight decay")
+        ax[0].scatter([], [], s=46, color=MUTED, alpha=.3, label="no regularisation")
+        ax[0].scatter([], [], s=46, color=MUTED, alpha=1.0,
+                      label="all three (hidden + input dropout + decay)")
         ax[0].legend(fontsize=8, ncol=2)
         fig.suptitle("Deep heads on the shallow encoding: shade = regularisation strength",
                      fontweight="bold", fontsize=10.5, x=0.01, ha="left")
