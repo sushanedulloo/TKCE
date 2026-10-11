@@ -26,6 +26,15 @@ and the tree baselines are cached, so the second session skips those too.
 
     python run_deep_head_suite.py --part B
     python run_deep_head_suite.py --aggregate-only --bundle
+
+The tiny grid is the follow-up: even the smallest heads above reached a
+training score of 1, so it drops the transformer and walks the MLP and
+TabResNet down a width ladder (32, 16, 8, 4, 2) that ends near the size of
+logistic regression. Width 32 equals the old "small", so those runs double as a
+reproducibility check against the previous run.
+
+    python run_deep_head_suite.py --grid tiny --root results/deep_head_tiny --part A
+    python run_deep_head_suite.py --grid tiny --root results/deep_head_tiny --part B
 """
 
 from __future__ import annotations
@@ -55,6 +64,19 @@ BATCH = {"bittf": 64}
 FULL_EPOCHS = {"bittf": 60}
 FULL_SIZES = {"bittf": ["small", "medium"]}
 SIZES = ["small", "medium", "large"]
+
+# Which heads and sizes each grid runs. Part C (the full encoding) belongs to the
+# main grid only; the tiny grid is about capacity on the shallow bits.
+GRIDS = {
+    "main": dict(heads=HEADS, sizes=SIZES, full_heads=HEADS),
+    "tiny": dict(heads=["mlp", "tabresnet"], sizes=["w32", "w16", "w8", "w4", "w2"],
+                 full_heads=[]),
+}
+# How each size is named in tables and charts. The ladder keeps its width in the
+# name so it can never be confused with the main grid's small/medium/large.
+SIZE_NAME = {"w32": "w32 large", "w16": "w16 medium", "w8": "w8 small",
+             "w4": "w4 tiny", "w2": "w2 micro"}
+HEAD_ORDER = ["mlp", "tabresnet", "bittf", "treetf"]
 # (label, hidden dropout, weight decay, INPUT dropout)
 #
 # The first grid was too weak to test anything. AdamW decay of 0.01 at lr 1e-3
@@ -82,18 +104,20 @@ QUICK = "--max-rows 2500 --rf-trees 20 --epochs 15 --patience 15"
 PY = sys.executable
 
 
-def plan(part):
+def plan(part, grid="main"):
     """Every run in the grid: (bits label, extra bit flags, head, size, reg)."""
+    g = GRIDS[grid]
     jobs = []
     if part in ("A", "all"):
         jobs += [("shallow", SHALLOW, "linear", "-", ("-", 0.0, 0.0, 0.0)),
                  ("full", FULL, "linear", "-", ("-", 0.0, 0.0, 0.0))]
     if part in ("B", "all"):
         jobs += [("shallow", SHALLOW, h, s, r)
-                 for h in HEADS for s in SIZES for r in REG]
+                 for h in g["heads"] for s in g["sizes"] for r in REG]
     if part in ("C", "all"):
         jobs += [("full", FULL, h, s, r)
-                 for h in HEADS for s in FULL_SIZES.get(h, SIZES) for r in REG_FULL]
+                 for h in g["full_heads"] for s in FULL_SIZES.get(h, g["sizes"])
+                 for r in REG_FULL]
     return jobs
 
 
@@ -207,14 +231,20 @@ def figures(t, root):
 
     # --- 1: test score by head, size and regularisation (shallow bits) ---
     sh = t[(t.bits == "shallow") & (t["head"] != "linear")]
+    heads = [h for h in HEAD_ORDER if (t["head"] == h).any()]
+
+    def sizes_of(g):
+        # smallest head first, so reading left to right means adding capacity
+        return list(g.groupby("size")["n_params"].first().sort_values().index)
+
     if len(sh):
         fig, ax = plt.subplots(1, 2, figsize=(13, 4.8))
         for a_, col, ttl, ref in [
                 (ax[0], "test", "Test ranking score", LIN),
                 (ax[1], "gap", "Overfitting gap (train minus validation)", 0.0)]:
             x = 0; ticks, labels = [], []
-            for h in HEADS:
-                for s in SIZES:
+            for h in heads:
+                for s in sizes_of(sh[sh["head"] == h]):
                     g = sh[(sh["head"] == h) & (sh["size"] == s)]
                     for j, (rl, *_rest) in enumerate(REG):
                         v = g[g.reg == rl]
@@ -223,7 +253,7 @@ def figures(t, root):
                                        color=HCOL[h],
                                        alpha=0.3 + 0.7 * j / max(1, len(REG) - 1),
                                        edgecolor="white", lw=.8, zorder=3)
-                    ticks.append(x); labels.append(f"{h}\n{s}")
+                    ticks.append(x); labels.append(f"{h}\n{SIZE_NAME.get(s, s)}")
                     x += 1
                 x += 0.6
             if not np.isnan(ref):
@@ -244,36 +274,49 @@ def figures(t, root):
         fig.savefig(os.path.join(root, "fig1_heads.png"), dpi=150)
         plt.close(fig)
 
-    # --- 2: capacity versus generalisation, shallow against full ---
+    # --- 2: capacity against generalisation: train, test and gap by weight count ---
     d = t[t["head"] != "linear"]
-    if len(d) and d.bits.nunique() > 1:
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4.4))
-        for a_, col, ttl in [(ax[0], "test", "Test ranking score"),
-                             (ax[1], "gap", "Overfitting gap")]:
+    if len(d):
+        fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
+        linr = t[t["head"] == "linear"]
+        for a_, col, ttl in [(ax[0], "train", "Training ranking score"),
+                             (ax[1], "test", "Test ranking score"),
+                             (ax[2], "gap", "Overfitting gap (train minus validation)")]:
             for bits, mk, ls in [("shallow", "o", "-"), ("full", "s", "--")]:
-                g = d[d.bits == bits].sort_values("n_params")
-                for h in HEADS:
+                g = d[d.bits == bits]
+                for h in heads:
                     gg = g[g["head"] == h]
-                    if len(gg):
-                        a_.plot(gg.n_params, gg[col], mk, ls=ls, ms=6, lw=1.2,
-                                color=HCOL[h], alpha=.85,
-                                label=f"{h}, {bits}" if col == "test" else None)
-            a_.set_xscale("log"); a_.set_xlabel("parameters in the head")
+                    if not len(gg):
+                        continue
+                    # every run as a faint dot, and the median of the six
+                    # regularisation settings at each size as the line
+                    a_.scatter(gg.n_params, gg[col], s=14, color=HCOL[h], alpha=.3,
+                               zorder=2)
+                    med = gg.groupby("n_params")[col].median()
+                    a_.plot(med.index, med.values, marker=mk, ls=ls, ms=6, lw=1.6,
+                            color=HCOL[h], zorder=3,
+                            label=f"{h}, {bits} bits" if col == "test" else None)
+            for _, r in linr.iterrows():
+                # filled star = shallow bits, hollow star = all levels
+                a_.scatter([r.n_params], [r[col]], marker="*", s=150, zorder=4,
+                           facecolor=INK if r.bits == "shallow" else "none",
+                           edgecolor=INK, linewidth=1.2,
+                           label=(f"logistic regression, {r.bits} bits"
+                                  if col == "test" else None))
+            a_.set_xscale("log"); a_.set_xlabel("weights in the head (log scale)")
             a_.set_title(ttl, fontweight="bold", loc="left", fontsize=10)
-        if not np.isnan(LIN):
-            ax[0].axhline(LIN, color=INK, lw=1.2, ls=":")
-        ax[0].axhline(CEIL, color=MUTED, lw=1.2, ls="--")
-        ax[0].legend(fontsize=7.5, ncol=2)
-        fig.suptitle("Capacity against generalisation: circles = shallow bits, "
-                     "squares = full encoding", fontweight="bold", fontsize=10.5,
-                     x=0.01, ha="left")
+        ax[1].axhline(CEIL, color=MUTED, lw=1.2, ls="--", label="best tree")
+        ax[1].legend(fontsize=7.5)
+        fig.suptitle("Capacity against generalisation: line = median of the six "
+                     "regularisation settings, dots = single runs",
+                     fontweight="bold", fontsize=10.5, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.93))
         fig.savefig(os.path.join(root, "fig2_capacity.png"), dpi=150)
         plt.close(fig)
 
     # --- 3: training curves of the best run per head ---
     curves = []
-    for h in HEADS:
+    for h in heads:
         g = t[(t["head"] == h) & (t.bits == "shallow")]
         if not len(g):
             continue
@@ -384,7 +427,29 @@ Reproduce
 """
 
 
-def aggregate(root, bundle=False):
+README_TINY = """
+
+THIS BUNDLE: THE TINY GRID
+  The previous run showed that even the smallest MLP and TabResNet (width 32)
+  reach a training score of 1. This run removes the transformer and walks both
+  heads down a width ladder. Only the width changes: every MLP keeps two hidden
+  layers and every TabResNet keeps two residual blocks.
+
+    size        width   MLP weights   TabResNet weights
+    w32 large     32       47,810          55,202     (= the old "small")
+    w16 medium    16       23,650          25,554
+    w8  small      8       11,762          12,266
+    w4  tiny       4        5,866           6,006
+    w2  micro      2        2,930           2,972
+    logistic regression on the same bits: 1,455 weights
+
+  The six regularisation settings, the bits, the split and the training rules
+  are exactly those of the previous run, so the w32 rows should repeat the old
+  "small" rows to within the noise.
+"""
+
+
+def aggregate(root, bundle=False, grid="main"):
     t = load_rows(root)
     if t.empty:
         print("[suite] nothing to aggregate yet")
@@ -427,14 +492,14 @@ def aggregate(root, bundle=False):
     print("  the ranking score is uncertain by about 0.01 here, so smaller "
           "differences are ties")
     with open(os.path.join(root, "README.txt"), "w") as f:
-        f.write(README)
+        f.write(README + (README_TINY if grid == "tiny" else ""))
     figures(t, root)
     if bundle:
         import zipfile
         stamp = time.strftime("%Y%m%d")
         parent = os.path.dirname(os.path.abspath(root))
-        path = os.path.join(parent, f"deep_head_{stamp}.zip")
         base = os.path.basename(os.path.abspath(root))
+        path = os.path.join(parent, f"{base}_{stamp}.zip")
         n = 0
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
             for dirpath, dirnames, files in os.walk(root):
@@ -454,6 +519,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="results/deep_head")
     ap.add_argument("--part", default="all", choices=["A", "B", "C", "all"])
+    ap.add_argument("--grid", default="main", choices=sorted(GRIDS),
+                    help="main: 3 heads x small/medium/large; tiny: mlp and "
+                         "tabresnet down the width ladder w32..w2, no transformer")
     ap.add_argument("--ckpt-dir", default=None)
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--sync-dir", default=None,
@@ -465,9 +533,12 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.root, exist_ok=True)
     if not args.aggregate_only:
-        run_all(args.root, plan(args.part), args.quick, args.ckpt_dir,
+        jobs = plan(args.part, args.grid)
+        if not jobs:
+            print(f"[suite] part {args.part} has no runs in the {args.grid} grid")
+        run_all(args.root, jobs, args.quick, args.ckpt_dir,
                 args.cache_dir, args.sync_dir)
-    aggregate(args.root, args.bundle)
+    aggregate(args.root, args.bundle, args.grid)
 
 
 if __name__ == "__main__":

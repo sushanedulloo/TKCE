@@ -235,7 +235,22 @@ SIZES = {
 }
 
 
+# The width ladder, for the run that asks how small a head can get. Even the
+# "small" sizes above still reach a training score of 1, so this ladder starts
+# at small's width (w32 is identical to small) and halves it down to 2, which is
+# about twice the weights of logistic regression. Only the width changes: every
+# MLP keeps two hidden layers and every TabResNet keeps two blocks. The names
+# are new on purpose, so results from this ladder can never be mistaken for the
+# small/medium/large results of earlier runs.
+for _w in (32, 16, 8, 4, 2):
+    SIZES["mlp"][f"w{_w}"] = (_w, _w)
+    SIZES["tabresnet"][f"w{_w}"] = dict(d=_w, d_hidden=2 * _w, n_blocks=2)
+
+
 def build_model(head, size, n_bits, n_classes, dropout, idx=None, mask=None):
+    if size not in SIZES.get(head, {}):
+        raise SystemExit(f"size '{size}' is not defined for head '{head}'; "
+                         f"choose from {sorted(SIZES.get(head, {}))}")
     if head == "mlp":
         return MLPHead(n_bits, n_classes, hidden_dims=SIZES["mlp"][size],
                        dropout=dropout, batchnorm=True)
@@ -341,7 +356,10 @@ def main():
     # the head
     ap.add_argument("--head", default="linear",
                     choices=["linear", "mlp", "tabresnet", "bittf", "treetf"])
-    ap.add_argument("--size", default="medium", choices=["small", "medium", "large"])
+    ap.add_argument("--size", default="medium",
+                    choices=sorted({s for h in SIZES.values() for s in h}),
+                    help="small/medium/large for every head; the width ladder "
+                         "w32/w16/w8/w4/w2 for mlp and tabresnet")
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--weight-decay", type=float, default=1e-5,
                     help="AdamW decoupled decay. NOTE 0.01 is almost a no-op here: "
@@ -469,6 +487,8 @@ def main():
 
         start_ep, best_val, best_state, best_ep, bad = 1, -1.0, None, 0, 0
         ck = os.path.join(args.ckpt_dir, f"ck_{ds.name}_{label}.pt") if args.ckpt_dir else None
+        if ck:
+            os.makedirs(args.ckpt_dir, exist_ok=True)   # first run in a fresh folder
         if ck and os.path.exists(ck) and not args.fresh:
             try:
                 st = torch.load(ck, map_location=device, weights_only=False)
